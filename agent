@@ -44,6 +44,126 @@ iso_date() {
   date -u +"%Y-%m-%d %H:%M UTC"
 }
 
+find_editor() {
+  if [ -n "${VISUAL:-}" ]; then
+    printf '%s\n' "$VISUAL"
+    return 0
+  fi
+
+  if [ -n "${EDITOR:-}" ]; then
+    printf '%s\n' "$EDITOR"
+    return 0
+  fi
+
+  local editor
+  for editor in nano vim vi; do
+    if command -v "$editor" >/dev/null 2>&1; then
+      printf '%s\n' "$editor"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+build_handover_summary_draft() {
+  local branch="$1"
+  local staged_count unstaged_count untracked_count total_count
+
+  staged_count=$(git diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
+  unstaged_count=$(git diff --name-only 2>/dev/null | wc -l | tr -d ' ')
+  untracked_count=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')
+  total_count=$((staged_count + unstaged_count + untracked_count))
+
+  if [ "$total_count" -gt 0 ] 2>/dev/null; then
+    printf 'Updated %s file(s) on %s.' "$total_count" "$branch"
+    return 0
+  fi
+
+  printf 'Wrapped up work on %s.' "$branch"
+}
+
+review_handover_draft() {
+  local branch="$1"
+  local last_commits="$2"
+  local staged="$3"
+  local unstaged="$4"
+  local draft_summary="$5"
+  local draft_decisions="$6"
+  local draft_next_steps="$7"
+  local choice editor draft_file input
+
+  while true; do
+    echo -e "${BOLD}Agent Handover${RESET} — $(iso_date)"
+    echo ""
+    echo -e "${DIM}Review the draft below. Edit it if needed, then accept to write the handover.${RESET}"
+    echo ""
+    echo -e "${BOLD}Draft Summary:${RESET} $draft_summary"
+    echo -e "${BOLD}Draft Decisions:${RESET} $draft_decisions"
+    echo -e "${BOLD}Draft Next Steps:${RESET} $draft_next_steps"
+    echo ""
+    echo -e "${DIM}Branch:${RESET} $branch"
+    echo -e "${DIM}Recent commits:${RESET}"
+    printf '%s\n' "$last_commits"
+    echo ""
+    echo -e "${DIM}Staged changes:${RESET}"
+    printf '%s\n' "$staged"
+    echo ""
+    echo -e "${DIM}Unstaged changes:${RESET}"
+    printf '%s\n' "$unstaged"
+    echo ""
+    printf 'Accept draft, edit draft, or cancel? [a/e/c]: '
+    read -r choice
+
+    case "$choice" in
+      a|A|"")
+        HANDOVER_SUMMARY="$draft_summary"
+        HANDOVER_DECISIONS="$draft_decisions"
+        HANDOVER_NEXT_STEPS="$draft_next_steps"
+        return 0
+        ;;
+      e|E)
+        if editor=$(find_editor); then
+          draft_file=$(mktemp)
+          cat > "$draft_file" << EOF
+Summary: $draft_summary
+Decisions: $draft_decisions
+Next Steps: $draft_next_steps
+EOF
+          "$editor" "$draft_file"
+          while IFS= read -r input; do
+            case "$input" in
+              Summary:*) draft_summary=${input#Summary: } ;;
+              Decisions:*) draft_decisions=${input#Decisions: } ;;
+              Next\ Steps:*) draft_next_steps=${input#Next Steps: } ;;
+            esac
+          done < "$draft_file"
+          rm -f "$draft_file"
+        else
+          printf 'Summary [%s]: ' "$draft_summary"
+          read -r input
+          [ -n "$input" ] && draft_summary="$input"
+          printf 'Decisions [%s]: ' "$draft_decisions"
+          read -r input
+          [ -n "$input" ] && draft_decisions="$input"
+          printf 'Next Steps [%s]: ' "$draft_next_steps"
+          read -r input
+          [ -n "$input" ] && draft_next_steps="$input"
+        fi
+        echo ""
+        ;;
+      c|C)
+        warn "handover cancelled"
+        return 1
+        ;;
+      *)
+        warn "enter 'a' to accept, 'e' to edit, or 'c' to cancel"
+        echo ""
+        ;;
+    esac
+  done
+}
+
 # ── Commands ──────────────────────────────────────────────
 
 cmd_init() {
@@ -158,12 +278,19 @@ cmd_handover() {
   staged=$(git diff --cached --stat 2>/dev/null || echo "nothing staged")
   local unstaged
   unstaged=$(git diff --stat 2>/dev/null || echo "nothing unstaged")
+  local untracked
+  untracked=$(git ls-files --others --exclude-standard 2>/dev/null)
+
+  if [ -n "$untracked" ]; then
+    unstaged=$(printf '%s\n\nUntracked files:\n%s' "$unstaged" "$untracked")
+  fi
 
   # Check for arguments (non-interactive mode for agents)
   local summary=""
   local decisions=""
   local next_steps=""
   local context=""
+  local summary_draft=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -184,16 +311,14 @@ cmd_handover() {
 
   # If still no args and interactive terminal, prompt
   if [ -z "$summary" ] && [ -t 0 ]; then
-    echo -e "${BOLD}Agent Handover${RESET} — $(iso_date)"
-    echo ""
-    echo -e "${DIM}What did you accomplish? (one line)${RESET}"
-    read -r summary
-    echo ""
-    echo -e "${DIM}Key decisions made? (one line, or empty to skip)${RESET}"
-    read -r decisions
-    echo ""
-    echo -e "${DIM}What should the next agent do? (one line, or empty to skip)${RESET}"
-    read -r next_steps
+    summary_draft=$(build_handover_summary_draft "$branch")
+    decisions="_No decisions logged._"
+    next_steps="_No next steps logged._"
+
+    review_handover_draft "$branch" "$last_commits" "$staged" "$unstaged" "$summary_draft" "$decisions" "$next_steps" || return 1
+    summary="$HANDOVER_SUMMARY"
+    decisions="$HANDOVER_DECISIONS"
+    next_steps="$HANDOVER_NEXT_STEPS"
   fi
 
   [ -z "$summary" ] && summary="Work session $(iso_date)"
@@ -247,8 +372,8 @@ EOF
   success "Handover saved to $handover_file"
   echo ""
   echo -e "  ${DIM}Summary:${RESET} $summary"
-  if [ -n "$decisions" ]; then echo -e "  ${DIM}Decisions:${RESET} $decisions"; fi
-  if [ -n "$next_steps" ]; then echo -e "  ${DIM}Next steps:${RESET} $next_steps"; fi
+  if [ -n "$decisions" ] && [ "$decisions" != "_No decisions logged._" ]; then echo -e "  ${DIM}Decisions:${RESET} $decisions"; fi
+  if [ -n "$next_steps" ] && [ "$next_steps" != "_No next steps logged._" ]; then echo -e "  ${DIM}Next steps:${RESET} $next_steps"; fi
   if [ -n "$context" ]; then echo -e "  ${DIM}Context:${RESET} $(echo "$context" | wc -c | tr -d ' ') bytes captured"; fi
 }
 
@@ -450,6 +575,9 @@ cmd_help() {
     # Log a handover before switching agents
     agent handover -s "Built auth with NextAuth" -d "Chose JWT over sessions" -n "Add protected routes"
 
+    # Interactive mode: review, edit, and accept the drafted handover
+    agent handover
+
     # Pipe conversation context from an agent session
     cat conversation.txt | agent handover -s "Debugging session"
 
@@ -466,9 +594,10 @@ cmd_help() {
     plus pointer files for every agent tool (.cursorrules, CLAUDE.md,
     .cosine/instructions.md, etc.) that all say "read AGENTS.md".
 
-    When you switch agents, run agent handover to log what you did,
-    what you decided, and what comes next. The next agent reads
-    AGENTS.md and the handover log to pick up seamlessly.
+    When you switch agents, run agent handover. It drafts a handover
+    from the current repo state, then lets a human review, edit, and
+    accept it before writing the log. The next agent reads AGENTS.md
+    and the handover log to pick up seamlessly.
 
     A pre-commit hook gently reminds you to handover before committing.
 
@@ -487,9 +616,10 @@ _generate_agents_md() {
 > agents working on this project. Every agent tool (Cursor, Claude Code, Cosine,
 > Copilot, etc.) is configured to point here.
 >
-> **Before ending your session**, run `agent handover` in the terminal to log
-> what you did, decisions you made, and what comes next. This updates the
-> "Current Progress" section below automatically.
+> **Before ending your session**, run `agent handover` in the terminal. It will
+> draft a handover from the current repo state; review, edit, and accept it so
+> the outgoing agent leaves a clean summary, decisions, and next steps. This
+> updates the "Current Progress" section below automatically.
 
 ## Project Overview
 

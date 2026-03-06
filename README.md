@@ -32,7 +32,7 @@ agent init
 # Edit AGENTS.md with your project context
 # ... then start working with any agent tool
 
-# Before switching agents, log what you did
+# Before switching agents, have the current agent draft a handover for human review
 agent handover -s "Built auth with NextAuth" -d "Chose JWT over sessions" -n "Add protected routes"
 
 # Check state
@@ -145,6 +145,14 @@ agent onboard bolt    # creates .bolt/instructions.md → AGENTS.md
 **pre-commit** — If no handover has been logged in the last 10 minutes and AGENTS.md isn't being updated in the commit, shows a reminder box. It never blocks the commit.
 
 **post-commit** — Appends the commit hash and message to the most recent handover log, linking handovers to commits.
+
+## Handover responsibility
+
+The current agent should draft the handover before ending its session, and a human should review it before it is accepted.
+
+- In interactive mode, `agent handover` drafts a handover from the current repo state, then lets the human review, edit, and accept it.
+- In non-interactive mode, pass `-s`, `-d`, and `-n` directly from the agent.
+- If you want to attach a conversation dump, pass `--context` or pipe it through stdin.
 
 ## Philosophy
 
