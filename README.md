@@ -14,12 +14,13 @@ You're building with AI agents. You start a task with Cursor, hit a wall, switch
 
 ```bash
 # Clone and add to PATH
-git clone https://github.com/your-org/agent-git.git ~/agent-git
-echo 'export PATH="$HOME/agent-git:$PATH"' >> ~/.zshrc
+git clone https://github.com/charis-algomo/agent-handoff.git ~/agent-handoff
+echo 'export PATH="$HOME/agent-handoff:$PATH"' >> ~/.zshrc
 source ~/.zshrc
-```
 
-Or just copy the `agent` script somewhere in your PATH.
+# Verify
+agent version
+```
 
 ## Quick start
 
@@ -136,6 +137,14 @@ agent onboard devin .devin/instructions.md
 # Or let it auto-create the path
 agent onboard bolt    # creates .bolt/instructions.md → AGENTS.md
 ```
+
+## Git hooks
+
+`agent init` installs two git hooks automatically:
+
+**pre-commit** — If no handover has been logged in the last 10 minutes and AGENTS.md isn't being updated in the commit, shows a reminder box. It never blocks the commit.
+
+**post-commit** — Appends the commit hash and message to the most recent handover log, linking handovers to commits.
 
 ## Philosophy
 

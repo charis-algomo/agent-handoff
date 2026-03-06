@@ -483,8 +483,13 @@ _generate_agents_md() {
   cat > "$AGENTS_MD" << 'AGENTS_TEMPLATE'
 # Agent Handoff Document
 
-> This is the single source of truth for all AI coding agents working on this project.
-> Read this file first when starting a new session. Update it before ending your session.
+> **Read this file first.** This is the single source of truth for all AI coding
+> agents working on this project. Every agent tool (Cursor, Claude Code, Cosine,
+> Copilot, etc.) is configured to point here.
+>
+> **Before ending your session**, run `agent handover` in the terminal to log
+> what you did, decisions you made, and what comes next. This updates the
+> "Current Progress" section below automatically.
 
 ## Project Overview
 
@@ -531,6 +536,22 @@ _TODO: List key files_
 <!-- Current tasks, priorities, and known issues -->
 
 _TODO: Add tasks_
+
+---
+
+## Agent Handoff Commands
+
+This repo uses [`agent-handoff`](https://github.com/charis-algomo/agent-handoff) for structured handoffs between agent sessions.
+
+```bash
+agent status              # Show current state
+agent handover            # Log progress (interactive)
+agent handover -s "..." -d "..." -n "..."  # Log progress (non-interactive)
+agent log                 # View handover history
+agent onboard <name>      # Register a new agent tool
+```
+
+Detailed handover logs are in `.agents/handovers/`.
 AGENTS_TEMPLATE
 }
 
