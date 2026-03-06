@@ -90,7 +90,8 @@ review_handover_draft() {
   local unstaged="$4"
   local draft_summary="$5"
   local draft_decisions="$6"
-  local draft_next_steps="$7"
+  local draft_learnings="$7"
+  local draft_next_steps="$8"
   local choice editor draft_file input
 
   while true; do
@@ -100,6 +101,7 @@ review_handover_draft() {
     echo ""
     echo -e "${BOLD}Draft Summary:${RESET} $draft_summary"
     echo -e "${BOLD}Draft Decisions:${RESET} $draft_decisions"
+    echo -e "${BOLD}Draft Learnings / Gotchas:${RESET} $draft_learnings"
     echo -e "${BOLD}Draft Next Steps:${RESET} $draft_next_steps"
     echo ""
     echo -e "${DIM}Branch:${RESET} $branch"
@@ -119,6 +121,7 @@ review_handover_draft() {
       a|A|"")
         HANDOVER_SUMMARY="$draft_summary"
         HANDOVER_DECISIONS="$draft_decisions"
+        HANDOVER_LEARNINGS="$draft_learnings"
         HANDOVER_NEXT_STEPS="$draft_next_steps"
         return 0
         ;;
@@ -128,6 +131,7 @@ review_handover_draft() {
           cat > "$draft_file" << EOF
 Summary: $draft_summary
 Decisions: $draft_decisions
+Learnings: $draft_learnings
 Next Steps: $draft_next_steps
 EOF
           "$editor" "$draft_file"
@@ -135,6 +139,7 @@ EOF
             case "$input" in
               Summary:*) draft_summary=${input#Summary: } ;;
               Decisions:*) draft_decisions=${input#Decisions: } ;;
+              Learnings:*) draft_learnings=${input#Learnings: } ;;
               Next\ Steps:*) draft_next_steps=${input#Next Steps: } ;;
             esac
           done < "$draft_file"
@@ -146,6 +151,9 @@ EOF
           printf 'Decisions [%s]: ' "$draft_decisions"
           read -r input
           [ -n "$input" ] && draft_decisions="$input"
+          printf 'Learnings [%s]: ' "$draft_learnings"
+          read -r input
+          [ -n "$input" ] && draft_learnings="$input"
           printf 'Next Steps [%s]: ' "$draft_next_steps"
           read -r input
           [ -n "$input" ] && draft_next_steps="$input"
@@ -288,6 +296,7 @@ cmd_handover() {
   # Check for arguments (non-interactive mode for agents)
   local summary=""
   local decisions=""
+  local learnings=""
   local next_steps=""
   local context=""
   local summary_draft=""
@@ -296,6 +305,7 @@ cmd_handover() {
     case "$1" in
       --summary|-s) summary="$2"; shift 2 ;;
       --decisions|-d) decisions="$2"; shift 2 ;;
+      --learnings|-l) learnings="$2"; shift 2 ;;
       --next|-n) next_steps="$2"; shift 2 ;;
       --context|-c) context="$2"; shift 2 ;;
       --stdin) context=$(cat); shift ;;
@@ -313,11 +323,13 @@ cmd_handover() {
   if [ -z "$summary" ] && [ -t 0 ]; then
     summary_draft=$(build_handover_summary_draft "$branch")
     decisions="_No decisions logged._"
+    learnings="_No learnings or gotchas logged._"
     next_steps="_No next steps logged._"
 
-    review_handover_draft "$branch" "$last_commits" "$staged" "$unstaged" "$summary_draft" "$decisions" "$next_steps" || return 1
+    review_handover_draft "$branch" "$last_commits" "$staged" "$unstaged" "$summary_draft" "$decisions" "$learnings" "$next_steps" || return 1
     summary="$HANDOVER_SUMMARY"
     decisions="$HANDOVER_DECISIONS"
+    learnings="$HANDOVER_LEARNINGS"
     next_steps="$HANDOVER_NEXT_STEPS"
   fi
 
@@ -332,6 +344,9 @@ $summary
 
 ## Key Decisions
 ${decisions:-_No decisions logged._}
+
+## Learnings / Gotchas
+${learnings:-_No learnings or gotchas logged._}
 
 ## Next Steps
 ${next_steps:-_No next steps logged._}
@@ -367,12 +382,13 @@ EOF
   fi
 
   # Update AGENTS.md with latest handover summary
-  _update_agents_md_progress "$summary" "$next_steps"
+  _update_agents_md_progress "$summary" "$learnings" "$next_steps"
 
   success "Handover saved to $handover_file"
   echo ""
   echo -e "  ${DIM}Summary:${RESET} $summary"
   if [ -n "$decisions" ] && [ "$decisions" != "_No decisions logged._" ]; then echo -e "  ${DIM}Decisions:${RESET} $decisions"; fi
+  if [ -n "$learnings" ] && [ "$learnings" != "_No learnings or gotchas logged._" ]; then echo -e "  ${DIM}Learnings:${RESET} $learnings"; fi
   if [ -n "$next_steps" ] && [ "$next_steps" != "_No next steps logged._" ]; then echo -e "  ${DIM}Next steps:${RESET} $next_steps"; fi
   if [ -n "$context" ]; then echo -e "  ${DIM}Context:${RESET} $(echo "$context" | wc -c | tr -d ' ') bytes captured"; fi
 }
@@ -561,11 +577,12 @@ cmd_help() {
 
   HANDOVER OPTIONS
 
-    agent handover --summary "what was done"     -s for short
-    agent handover --decisions "key choices"      -d for short
-    agent handover --next "what to do next"       -n for short
-    agent handover --context "conversation dump"  -c for short
-    agent handover --stdin                        read context from stdin
+    agent handover --summary "what was done"         -s for short
+    agent handover --decisions "key choices"        -d for short
+    agent handover --learnings "gotchas to know"    -l for short
+    agent handover --next "what to do next"         -n for short
+    agent handover --context "conversation dump"    -c for short
+    agent handover --stdin                           read context from stdin
 
   EXAMPLES
 
@@ -573,7 +590,7 @@ cmd_help() {
     cd my-project && agent init
 
     # Log a handover before switching agents
-    agent handover -s "Built auth with NextAuth" -d "Chose JWT over sessions" -n "Add protected routes"
+    agent handover -s "Built auth with NextAuth" -d "Chose JWT over sessions" -l "Middleware expects req.auth to be present" -n "Add protected routes"
 
     # Interactive mode: review, edit, and accept the drafted handover
     agent handover
@@ -596,8 +613,9 @@ cmd_help() {
 
     When you switch agents, run agent handover. It drafts a handover
     from the current repo state, then lets a human review, edit, and
-    accept it before writing the log. The next agent reads AGENTS.md
-    and the handover log to pick up seamlessly.
+    accept it before writing the log. Include any learnings or gotchas
+    the next agent should know. The next agent reads AGENTS.md and the
+    handover log to pick up seamlessly.
 
     A pre-commit hook gently reminds you to handover before committing.
 
@@ -618,8 +636,9 @@ _generate_agents_md() {
 >
 > **Before ending your session**, run `agent handover` in the terminal. It will
 > draft a handover from the current repo state; review, edit, and accept it so
-> the outgoing agent leaves a clean summary, decisions, and next steps. This
-> updates the "Current Progress" section below automatically.
+> the outgoing agent leaves a clean summary, decisions, learnings or gotchas,
+> and next steps. This updates the "Current Progress" section below
+> automatically.
 
 ## Project Overview
 
@@ -676,7 +695,7 @@ This repo uses [`agent-handoff`](https://github.com/charis-algomo/agent-handoff)
 ```bash
 agent status              # Show current state
 agent handover            # Log progress (interactive)
-agent handover -s "..." -d "..." -n "..."  # Log progress (non-interactive)
+agent handover -s "..." -d "..." -l "..." -n "..."  # Log progress (non-interactive)
 agent log                 # View handover history
 agent onboard <name>      # Register a new agent tool
 ```
@@ -828,7 +847,8 @@ HOOK
 
 _update_agents_md_progress() {
   local summary="$1"
-  local next_steps="$2"
+  local learnings="$2"
+  local next_steps="$3"
 
   if [ ! -f "$AGENTS_MD" ]; then
     return 0
@@ -879,6 +899,22 @@ ${next_entry}
 " "$AGENTS_MD"
       else
         sed -i "${insert_at}i\\${next_entry}" "$AGENTS_MD"
+      fi
+    fi
+  fi
+
+  if [ -n "$learnings" ] && [ "$learnings" != "_No learnings or gotchas logged._" ]; then
+    local decisions_line
+    decisions_line=$(grep -n "^## Architecture & Key Decisions" "$AGENTS_MD" | head -1 | cut -d: -f1 || true)
+    if [ -n "$decisions_line" ]; then
+      local insert_at=$((decisions_line + 4))
+      local learning_entry="- Learning / gotcha: $learnings"
+      if [[ "$OSTYPE" == "darwin"* ]]; then
+        sed -i '' "${insert_at}i\\
+${learning_entry}
+" "$AGENTS_MD"
+      else
+        sed -i "${insert_at}i\\${learning_entry}" "$AGENTS_MD"
       fi
     fi
   fi

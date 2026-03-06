@@ -33,7 +33,7 @@ agent init
 # ... then start working with any agent tool
 
 # Before switching agents, have the current agent draft a handover for human review
-agent handover -s "Built auth with NextAuth" -d "Chose JWT over sessions" -n "Add protected routes"
+agent handover -s "Built auth with NextAuth" -d "Chose JWT over sessions" -l "Middleware expects req.auth to be present" -n "Add protected routes"
 
 # Check state
 agent status
@@ -151,7 +151,8 @@ agent onboard bolt    # creates .bolt/instructions.md → AGENTS.md
 The current agent should draft the handover before ending its session, and a human should review it before it is accepted.
 
 - In interactive mode, `agent handover` drafts a handover from the current repo state, then lets the human review, edit, and accept it.
-- In non-interactive mode, pass `-s`, `-d`, and `-n` directly from the agent.
+- In non-interactive mode, pass `-s`, `-d`, `-l`, and `-n` directly from the agent.
+- Use the learnings / gotchas field to record anything the next agent should know, such as sharp edges, environment quirks, failed approaches, or assumptions hidden in the code.
 - If you want to attach a conversation dump, pass `--context` or pipe it through stdin.
 
 ## Philosophy
