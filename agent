@@ -1,0 +1,684 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+AGENTS_DIR=".agents"
+AGENTS_MD="AGENTS.md"
+HANDOVERS_DIR="$AGENTS_DIR/handovers"
+HOOKS_DIR="$AGENTS_DIR/hooks"
+CONFIG_FILE="$AGENTS_DIR/config.yaml"
+
+# ── Colors ────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ── Helpers ───────────────────────────────────────────────
+
+die() { echo -e "${RED}error:${RESET} $1" >&2; exit 1; }
+info() { echo -e "${BLUE}→${RESET} $1"; }
+success() { echo -e "${GREEN}✓${RESET} $1"; }
+warn() { echo -e "${YELLOW}!${RESET} $1"; }
+
+require_git() {
+  git rev-parse --git-dir &>/dev/null || die "not a git repository. Run 'git init' first."
+}
+
+require_init() {
+  [ -d "$AGENTS_DIR" ] || die "agent not initialized. Run 'agent init' first."
+}
+
+repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null || pwd
+}
+
+timestamp() {
+  date -u +"%Y-%m-%dT%H-%M-%S"
+}
+
+iso_date() {
+  date -u +"%Y-%m-%d %H:%M UTC"
+}
+
+# ── Commands ──────────────────────────────────────────────
+
+cmd_init() {
+  require_git
+  local root
+  root=$(repo_root)
+  cd "$root"
+
+  if [ -d "$AGENTS_DIR" ]; then
+    warn "already initialized at $root/$AGENTS_DIR"
+    echo "  Run 'agent reinit' to regenerate config files."
+    return 0
+  fi
+
+  local project_name
+  project_name=$(basename "$root")
+
+  info "Initializing agent handoff system in ${BOLD}$root${RESET}"
+
+  # Create directory structure
+  mkdir -p "$HANDOVERS_DIR" "$HOOKS_DIR"
+
+  # Create config
+  cat > "$CONFIG_FILE" << EOF
+# Agent handoff configuration
+project: $project_name
+created: $(iso_date)
+
+# Conventions for agents working on this repo
+conventions:
+  language: auto        # auto-detect from repo
+  test_before_commit: true
+  update_handover: true # remind agents to write handover before committing
+
+# Agent-specific config file pointers (all point to AGENTS.md)
+# These are auto-generated — edit AGENTS.md, not these files
+agent_files:
+  # IDE agents
+  - .cursorrules              # Cursor
+  - .windsurfrules            # Windsurf
+  - .clinerules               # Cline
+  - .github/copilot-instructions.md  # GitHub Copilot
+  # Terminal agents
+  - CLAUDE.md                 # Claude Code
+  - .cosine/instructions.md   # Cosine (cos2)
+  - .opencode/instructions.md # OpenCode
+  - .codex/instructions.md    # Codex
+  - .aider.conf.yml           # Aider
+  # Generic
+  - CONVENTIONS.md
+EOF
+
+  # Create AGENTS.md from template
+  _generate_agents_md "$project_name"
+
+  # Create agent config pointers
+  _create_agent_pointers
+
+  # Install git hooks
+  _install_hooks
+
+  # Create .gitignore additions
+  if [ -f .gitignore ]; then
+    if ! grep -q ".agents/handovers/" .gitignore 2>/dev/null; then
+      echo "" >> .gitignore
+      echo "# Agent handoff context dumps (can be large)" >> .gitignore
+      echo "# Uncomment the next line to exclude handover logs from git" >> .gitignore
+      echo "# .agents/handovers/" >> .gitignore
+    fi
+  fi
+
+  echo ""
+  success "Agent handoff system initialized"
+  echo ""
+  echo -e "  ${BOLD}What was created:${RESET}"
+  echo -e "  ${DIM}AGENTS.md${RESET}              ← the source of truth (edit this)"
+  echo -e "  ${DIM}.agents/${RESET}               ← handovers, config, hooks"
+  echo ""
+  echo -e "  ${BOLD}Agent pointers (all → AGENTS.md):${RESET}"
+  echo -e "  ${DIM}.cursorrules${RESET}            Cursor"
+  echo -e "  ${DIM}.windsurfrules${RESET}          Windsurf"
+  echo -e "  ${DIM}.clinerules${RESET}             Cline"
+  echo -e "  ${DIM}.github/copilot-*.md${RESET}    GitHub Copilot"
+  echo -e "  ${DIM}CLAUDE.md${RESET}               Claude Code"
+  echo -e "  ${DIM}.cosine/instructions${RESET}    Cosine (cos2)"
+  echo -e "  ${DIM}.opencode/instructions${RESET}  OpenCode"
+  echo -e "  ${DIM}.codex/instructions${RESET}     Codex"
+  echo -e "  ${DIM}.aider.conf.yml${RESET}         Aider"
+  echo ""
+  echo -e "  ${BOLD}Next steps:${RESET}"
+  echo -e "  1. Edit ${BOLD}AGENTS.md${RESET} with your project context"
+  echo -e "  2. Start working with ${BOLD}any${RESET} agent tool — they all read AGENTS.md"
+  echo -e "  3. Run ${BOLD}agent handover${RESET} before switching to a different agent"
+}
+
+cmd_handover() {
+  require_init
+  local root
+  root=$(repo_root)
+  cd "$root"
+
+  local ts
+  ts=$(timestamp)
+  local handover_file="$HANDOVERS_DIR/$ts.md"
+
+  # Gather context
+  local branch
+  branch=$(git branch --show-current 2>/dev/null || echo "unknown")
+  local last_commits
+  last_commits=$(git log --oneline -5 2>/dev/null || echo "no commits yet")
+  local staged
+  staged=$(git diff --cached --stat 2>/dev/null || echo "nothing staged")
+  local unstaged
+  unstaged=$(git diff --stat 2>/dev/null || echo "nothing unstaged")
+
+  # Check for arguments (non-interactive mode for agents)
+  local summary=""
+  local decisions=""
+  local next_steps=""
+  local context=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --summary|-s) summary="$2"; shift 2 ;;
+      --decisions|-d) decisions="$2"; shift 2 ;;
+      --next|-n) next_steps="$2"; shift 2 ;;
+      --context|-c) context="$2"; shift 2 ;;
+      --stdin) context=$(cat); shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  # If no args, check if stdin has data (piped context)
+  if [ -z "$summary" ] && [ -z "$context" ] && [ ! -t 0 ]; then
+    context=$(cat)
+    summary="Automated handover"
+  fi
+
+  # If still no args and interactive terminal, prompt
+  if [ -z "$summary" ] && [ -t 0 ]; then
+    echo -e "${BOLD}Agent Handover${RESET} — $(iso_date)"
+    echo ""
+    echo -e "${DIM}What did you accomplish? (one line)${RESET}"
+    read -r summary
+    echo ""
+    echo -e "${DIM}Key decisions made? (one line, or empty to skip)${RESET}"
+    read -r decisions
+    echo ""
+    echo -e "${DIM}What should the next agent do? (one line, or empty to skip)${RESET}"
+    read -r next_steps
+  fi
+
+  [ -z "$summary" ] && summary="Work session $(iso_date)"
+
+  # Write handover file
+  cat > "$handover_file" << EOF
+# Handover — $(iso_date)
+
+## Summary
+$summary
+
+## Key Decisions
+${decisions:-_No decisions logged._}
+
+## Next Steps
+${next_steps:-_No next steps logged._}
+
+## Git State
+- **Branch:** $branch
+- **Recent commits:**
+\`\`\`
+$last_commits
+\`\`\`
+- **Staged changes:**
+\`\`\`
+$staged
+\`\`\`
+- **Unstaged changes:**
+\`\`\`
+$unstaged
+\`\`\`
+EOF
+
+  # Append context dump if provided
+  if [ -n "$context" ]; then
+    cat >> "$handover_file" << EOF
+
+## Conversation Context
+<details>
+<summary>Full context from agent session (click to expand)</summary>
+
+$context
+
+</details>
+EOF
+  fi
+
+  # Update AGENTS.md with latest handover summary
+  _update_agents_md_progress "$summary" "$next_steps"
+
+  success "Handover saved to $handover_file"
+  echo ""
+  echo -e "  ${DIM}Summary:${RESET} $summary"
+  if [ -n "$decisions" ]; then echo -e "  ${DIM}Decisions:${RESET} $decisions"; fi
+  if [ -n "$next_steps" ]; then echo -e "  ${DIM}Next steps:${RESET} $next_steps"; fi
+  if [ -n "$context" ]; then echo -e "  ${DIM}Context:${RESET} $(echo "$context" | wc -c | tr -d ' ') bytes captured"; fi
+}
+
+cmd_status() {
+  require_init
+  local root
+  root=$(repo_root)
+  cd "$root"
+
+  local project_name
+  project_name=$(basename "$root")
+
+  echo -e "${BOLD}Agent Status — $project_name${RESET}"
+  echo ""
+
+  # Last handover
+  local latest
+  latest=$(ls -t "$HANDOVERS_DIR"/*.md 2>/dev/null | head -1)
+  if [ -n "$latest" ]; then
+    local handover_name
+    handover_name=$(basename "$latest" .md)
+    local handover_summary
+    handover_summary=$(sed -n '/^## Summary$/,/^##/{/^## Summary$/d;/^##/d;p;}' "$latest" | head -3 | sed 's/^[[:space:]]*//')
+    echo -e "  ${BOLD}Last handover:${RESET} $handover_name"
+    echo -e "  ${DIM}$handover_summary${RESET}"
+  else
+    echo -e "  ${BOLD}Last handover:${RESET} ${DIM}none${RESET}"
+  fi
+  echo ""
+
+  # Handover count
+  local count
+  count=$(ls "$HANDOVERS_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ')
+  echo -e "  ${BOLD}Total handovers:${RESET} $count"
+
+  # Git state
+  local branch
+  branch=$(git branch --show-current 2>/dev/null || echo "unknown")
+  local uncommitted
+  uncommitted=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  echo -e "  ${BOLD}Branch:${RESET} $branch"
+  echo -e "  ${BOLD}Uncommitted changes:${RESET} $uncommitted files"
+
+  # AGENTS.md exists and has content
+  if [ -f "$AGENTS_MD" ]; then
+    local lines
+    lines=$(wc -l < "$AGENTS_MD" | tr -d ' ')
+    echo -e "  ${BOLD}AGENTS.md:${RESET} $lines lines"
+  else
+    echo -e "  ${BOLD}AGENTS.md:${RESET} ${RED}missing${RESET}"
+  fi
+  echo ""
+}
+
+cmd_log() {
+  require_init
+  local root
+  root=$(repo_root)
+  cd "$root"
+
+  local handovers
+  handovers=$(ls -t "$HANDOVERS_DIR"/*.md 2>/dev/null)
+
+  if [ -z "$handovers" ]; then
+    echo -e "${DIM}No handovers yet. Run 'agent handover' to create one.${RESET}"
+    return 0
+  fi
+
+  echo -e "${BOLD}Handover Log${RESET}"
+  echo ""
+
+  local limit=${1:-10}
+  local i=0
+
+  for file in $handovers; do
+    [ $i -ge "$limit" ] && break
+    local name
+    name=$(basename "$file" .md)
+    local summary
+    summary=$(sed -n '/^## Summary$/,/^##/{/^## Summary$/d;/^##/d;p;}' "$file" | head -1 | sed 's/^[[:space:]]*//')
+    echo -e "  ${YELLOW}$name${RESET}  $summary"
+    i=$((i + 1))
+  done
+
+  local total
+  total=$(ls "$HANDOVERS_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$total" -gt "$limit" ] 2>/dev/null; then
+    echo -e "\n  ${DIM}... and $((total - limit)) more${RESET}"
+  fi
+}
+
+cmd_reinit() {
+  require_git
+  require_init
+  local root
+  root=$(repo_root)
+  cd "$root"
+
+  info "Regenerating agent config files"
+  _create_agent_pointers
+  _install_hooks
+  success "Agent config files regenerated"
+}
+
+cmd_help() {
+  cat << 'EOF'
+
+  agent — git for agents
+
+  Structured handoff system so any AI coding agent can pick up
+  where the last one left off. Start with Cursor, continue with
+  Claude Code, finish with Cosine — no context lost.
+
+  Works with: Cursor, Windsurf, Cline, GitHub Copilot, Claude Code,
+  Cosine (cos2), OpenCode, Codex, Aider, and any future agent tool.
+
+  COMMANDS
+
+    agent init          Initialize agent handoff in a git repo
+    agent handover      Log progress, decisions, and context
+    agent status        Show current agent state
+    agent log [n]       Show recent handover entries
+    agent reinit        Regenerate config files and hooks
+
+  HANDOVER OPTIONS
+
+    agent handover --summary "what was done"     -s for short
+    agent handover --decisions "key choices"      -d for short
+    agent handover --next "what to do next"       -n for short
+    agent handover --context "conversation dump"  -c for short
+    agent handover --stdin                        read context from stdin
+
+  EXAMPLES
+
+    # Initialize a repo
+    cd my-project && agent init
+
+    # Log a handover before switching agents
+    agent handover -s "Built auth with NextAuth" -d "Chose JWT over sessions" -n "Add protected routes"
+
+    # Pipe conversation context from an agent session
+    cat conversation.txt | agent handover -s "Debugging session"
+
+    # Check current state
+    agent status
+
+  HOW IT WORKS
+
+    agent init creates AGENTS.md as the single source of truth,
+    plus pointer files for every agent tool (.cursorrules, CLAUDE.md,
+    .cosine/instructions.md, etc.) that all say "read AGENTS.md".
+
+    When you switch agents, run agent handover to log what you did,
+    what you decided, and what comes next. The next agent reads
+    AGENTS.md and the handover log to pick up seamlessly.
+
+    A pre-commit hook gently reminds you to handover before committing.
+
+EOF
+}
+
+# ── Internal functions ────────────────────────────────────
+
+_generate_agents_md() {
+  local project_name="$1"
+
+  cat > "$AGENTS_MD" << 'AGENTS_TEMPLATE'
+# Agent Handoff Document
+
+> This is the single source of truth for all AI coding agents working on this project.
+> Read this file first when starting a new session. Update it before ending your session.
+
+## Project Overview
+
+<!-- Describe what this project is, what it does, and its current state -->
+
+_TODO: Add project overview_
+
+## Current Progress
+
+<!-- Updated automatically by `agent handover`. Edit manually if needed. -->
+
+_No handovers yet._
+
+## Architecture & Key Decisions
+
+<!-- Document important architectural choices and why they were made -->
+
+_TODO: Document key decisions_
+
+## Conventions
+
+<!-- Project-specific rules that all agents should follow -->
+
+- Follow existing code style and patterns
+- Run tests before committing
+- Update this document when making architectural decisions
+
+## Key Files
+
+<!-- List the most important files an agent should read to understand the project -->
+
+_TODO: List key files_
+
+## How to Run
+
+<!-- Commands to build, test, and run the project -->
+
+```bash
+# TODO: Add run commands
+```
+
+## What Needs to Be Done
+
+<!-- Current tasks, priorities, and known issues -->
+
+_TODO: Add tasks_
+AGENTS_TEMPLATE
+}
+
+_create_agent_pointers() {
+  # Every AI coding agent reads a different config file.
+  # We create ALL of them, each pointing to AGENTS.md as the single source of truth.
+  # This means you can switch between any agent tool and they all get the same context.
+
+  local pointer
+  pointer=$(cat << 'POINTER'
+# Agent Instructions
+
+Read the `AGENTS.md` file in this repository root for all project context,
+architecture decisions, conventions, progress history, and handoff notes.
+
+That file is the single source of truth maintained across all agent sessions.
+Always read it at the start of a new session. Update it when you make
+significant decisions or complete major work.
+POINTER
+)
+
+  # ── IDE agents ──────────────────────────────────────────
+  # Cursor
+  echo "$pointer" > .cursorrules
+
+  # Windsurf
+  echo "$pointer" > .windsurfrules
+
+  # Cline (VS Code extension)
+  echo "$pointer" > .clinerules
+
+  # GitHub Copilot
+  mkdir -p .github
+  echo "$pointer" > .github/copilot-instructions.md
+
+  # ── Terminal agents ─────────────────────────────────────
+  # Claude Code
+  echo "$pointer" > CLAUDE.md
+
+  # Cosine (cos2)
+  mkdir -p .cosine
+  echo "$pointer" > .cosine/instructions.md
+
+  # OpenCode
+  mkdir -p .opencode
+  echo "$pointer" > .opencode/instructions.md
+
+  # Codex (OpenAI)
+  mkdir -p .codex
+  echo "$pointer" > .codex/instructions.md
+
+  # Aider
+  echo "$pointer" > .aider.conf.yml
+
+  # ── Generic ─────────────────────────────────────────────
+  # Some agents look for these
+  echo "$pointer" > CONVENTIONS.md
+}
+
+_install_hooks() {
+  local git_hooks_dir
+  git_hooks_dir=$(git rev-parse --git-dir)/hooks
+
+  # Pre-commit hook
+  cat > "$git_hooks_dir/pre-commit" << 'HOOK'
+#!/usr/bin/env bash
+# Agent handoff pre-commit hook
+# Reminds agents to create a handover entry before committing
+
+AGENTS_DIR=".agents"
+HANDOVERS_DIR="$AGENTS_DIR/handovers"
+
+if [ ! -d "$AGENTS_DIR" ]; then
+  exit 0  # Not an agent-initialized repo
+fi
+
+# Check if there's a recent handover (within last 10 minutes)
+if [ -d "$HANDOVERS_DIR" ]; then
+  latest=$(ls -t "$HANDOVERS_DIR"/*.md 2>/dev/null | head -1)
+  if [ -n "$latest" ]; then
+    # Get file modification time
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      file_time=$(stat -f %m "$latest" 2>/dev/null || echo 0)
+    else
+      file_time=$(stat -c %Y "$latest" 2>/dev/null || echo 0)
+    fi
+    now=$(date +%s)
+    age=$(( now - file_time ))
+
+    if [ $age -lt 600 ]; then
+      # Recent handover exists, proceed
+      exit 0
+    fi
+  fi
+fi
+
+# No recent handover — check if AGENTS.md was modified in this commit
+if git diff --cached --name-only | grep -q "^AGENTS.md$"; then
+  exit 0  # AGENTS.md is being updated, that counts
+fi
+
+# Warn but don't block
+echo ""
+echo "┌─────────────────────────────────────────────────────┐"
+echo "│  agent: No recent handover found.                   │"
+echo "│                                                     │"
+echo "│  Consider running 'agent handover' to log your      │"
+echo "│  progress so the next agent can pick up your work.  │"
+echo "│                                                     │"
+echo "│  This is a reminder, not a blocker.                 │"
+echo "└─────────────────────────────────────────────────────┘"
+echo ""
+
+exit 0
+HOOK
+  chmod +x "$git_hooks_dir/pre-commit"
+
+  # Post-commit hook — append commit info to latest handover
+  cat > "$git_hooks_dir/post-commit" << 'HOOK'
+#!/usr/bin/env bash
+# Agent handoff post-commit hook
+# Records commit hash in the latest handover
+
+AGENTS_DIR=".agents"
+HANDOVERS_DIR="$AGENTS_DIR/handovers"
+
+if [ ! -d "$AGENTS_DIR" ]; then
+  exit 0
+fi
+
+latest=$(ls -t "$HANDOVERS_DIR"/*.md 2>/dev/null | head -1)
+if [ -n "$latest" ]; then
+  hash=$(git rev-parse --short HEAD 2>/dev/null)
+  msg=$(git log --oneline -1 2>/dev/null)
+  echo "" >> "$latest"
+  echo "## Commit" >> "$latest"
+  echo "\`$msg\`" >> "$latest"
+fi
+
+exit 0
+HOOK
+  chmod +x "$git_hooks_dir/post-commit"
+}
+
+_update_agents_md_progress() {
+  local summary="$1"
+  local next_steps="$2"
+
+  if [ ! -f "$AGENTS_MD" ]; then
+    return 0
+  fi
+
+  local date_str
+  date_str=$(iso_date)
+
+  # Build the new progress entry
+  local entry="- **$date_str** — $summary"
+
+  # Check if the progress section has the placeholder
+  if grep -q "^_No handovers yet._$" "$AGENTS_MD"; then
+    # Replace the placeholder with the first entry
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      sed -i '' "s/^_No handovers yet._$/$entry/" "$AGENTS_MD"
+    else
+      sed -i "s/^_No handovers yet._$/$entry/" "$AGENTS_MD"
+    fi
+  else
+    # Append after the "## Current Progress" section
+    # Find the line number of "## Current Progress" and insert after the next non-empty line
+    local line_num
+    line_num=$(grep -n "^## Current Progress" "$AGENTS_MD" | head -1 | cut -d: -f1)
+    if [ -n "$line_num" ]; then
+      # Find the next content line after the section header and any comments
+      local insert_after=$((line_num + 2))
+      if [[ "$OSTYPE" == "darwin"* ]]; then
+        sed -i '' "${insert_after}i\\
+${entry}
+" "$AGENTS_MD"
+      else
+        sed -i "${insert_after}i\\${entry}" "$AGENTS_MD"
+      fi
+    fi
+  fi
+
+  # Update "What Needs to Be Done" if next_steps provided
+  if [ -n "$next_steps" ] && [ "$next_steps" != "_No next steps logged._" ]; then
+    local needs_line
+    needs_line=$(grep -n "^## What Needs to Be Done" "$AGENTS_MD" | head -1 | cut -d: -f1 || true)
+    if [ -n "$needs_line" ]; then
+      local insert_at=$((needs_line + 4))
+      local next_entry="- $next_steps"
+      if [[ "$OSTYPE" == "darwin"* ]]; then
+        sed -i '' "${insert_at}i\\
+${next_entry}
+" "$AGENTS_MD"
+      else
+        sed -i "${insert_at}i\\${next_entry}" "$AGENTS_MD"
+      fi
+    fi
+  fi
+
+  return 0
+}
+
+# ── Main dispatch ─────────────────────────────────────────
+
+case "${1:-help}" in
+  init)       shift; cmd_init "$@" ;;
+  handover)   shift; cmd_handover "$@" ;;
+  status)     shift; cmd_status "$@" ;;
+  log)        shift; cmd_log "$@" ;;
+  reinit)     shift; cmd_reinit "$@" ;;
+  help|--help|-h) cmd_help ;;
+  version|--version|-v) echo "agent $VERSION" ;;
+  *) die "unknown command: $1. Run 'agent help' for usage." ;;
+esac
