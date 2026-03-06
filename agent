@@ -340,6 +340,66 @@ cmd_log() {
   fi
 }
 
+cmd_onboard() {
+  require_init
+  local root
+  root=$(repo_root)
+  cd "$root"
+
+  local name="${1:-}"
+  local config_path="${2:-}"
+
+  if [ -z "$name" ]; then
+    echo -e "${BOLD}Onboard a new agent tool${RESET}"
+    echo ""
+    echo -e "${DIM}Agent tool name (e.g. 'devin', 'bolt', 'replit-agent'):${RESET}"
+    read -r name
+    [ -z "$name" ] && die "agent name is required"
+    echo ""
+    echo -e "${DIM}Config file path this agent reads (e.g. '.devin/instructions.md', 'DEVIN.md'):${RESET}"
+    echo -e "${DIM}Leave empty to create ${name}.md in the repo root${RESET}"
+    read -r config_path
+  fi
+
+  # Default config path: {name}.md in repo root, or .{name}/instructions.md if name is lowercase
+  if [ -z "$config_path" ]; then
+    local lower
+    lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    config_path=".${lower}/instructions.md"
+  fi
+
+  # Create the pointer file
+  local pointer
+  pointer=$(cat << 'POINTER'
+# Agent Instructions
+
+Read the `AGENTS.md` file in this repository root for all project context,
+architecture decisions, conventions, progress history, and handoff notes.
+
+That file is the single source of truth maintained across all agent sessions.
+Always read it at the start of a new session. Update it when you make
+significant decisions or complete major work.
+POINTER
+)
+
+  local dir
+  dir=$(dirname "$config_path")
+  if [ "$dir" != "." ]; then
+    mkdir -p "$dir"
+  fi
+  echo "$pointer" > "$config_path"
+
+  # Register in config
+  echo "  - $config_path    # $name" >> "$CONFIG_FILE"
+
+  success "Onboarded ${BOLD}$name${RESET}"
+  echo ""
+  echo -e "  ${DIM}Created:${RESET} $config_path → points to AGENTS.md"
+  echo -e "  ${DIM}Registered in:${RESET} $CONFIG_FILE"
+  echo ""
+  echo -e "  $name will now read AGENTS.md when it opens this repo."
+}
+
 cmd_reinit() {
   require_git
   require_init
@@ -367,11 +427,12 @@ cmd_help() {
 
   COMMANDS
 
-    agent init          Initialize agent handoff in a git repo
-    agent handover      Log progress, decisions, and context
-    agent status        Show current agent state
-    agent log [n]       Show recent handover entries
-    agent reinit        Regenerate config files and hooks
+    agent init                    Initialize agent handoff in a git repo
+    agent handover                Log progress, decisions, and context
+    agent status                  Show current agent state
+    agent log [n]                 Show recent handover entries
+    agent onboard <name> [path]   Register a new/unknown agent tool
+    agent reinit                  Regenerate config files and hooks
 
   HANDOVER OPTIONS
 
@@ -394,6 +455,10 @@ cmd_help() {
 
     # Check current state
     agent status
+
+    # New agent tool? Onboard it
+    agent onboard devin .devin/instructions.md
+    agent onboard bolt                           # auto-creates .bolt/instructions.md
 
   HOW IT WORKS
 
@@ -677,6 +742,7 @@ case "${1:-help}" in
   handover)   shift; cmd_handover "$@" ;;
   status)     shift; cmd_status "$@" ;;
   log)        shift; cmd_log "$@" ;;
+  onboard)    shift; cmd_onboard "$@" ;;
   reinit)     shift; cmd_reinit "$@" ;;
   help|--help|-h) cmd_help ;;
   version|--version|-v) echo "agent $VERSION" ;;

@@ -71,6 +71,7 @@ Every agent tool reads its own config file. They all point to `AGENTS.md`. One s
 | `agent handover` | Log progress, decisions, and context |
 | `agent status` | Show current state |
 | `agent log` | Show recent handover entries |
+| `agent onboard <name> [path]` | Register a new/unknown agent tool |
 | `agent reinit` | Regenerate all config/pointer files |
 
 ## Handover options
@@ -126,7 +127,15 @@ Agent B continues the work seamlessly
 | Codex | `.codex/instructions.md` | ✓ |
 | Aider | `.aider.conf.yml` | ✓ |
 
-Adding a new agent tool is one line — create its config file pointing to AGENTS.md.
+New agent tool? Onboard it in one command:
+
+```bash
+# Register a new agent with its config file path
+agent onboard devin .devin/instructions.md
+
+# Or let it auto-create the path
+agent onboard bolt    # creates .bolt/instructions.md → AGENTS.md
+```
 
 ## Philosophy
 
