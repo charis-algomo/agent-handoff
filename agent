@@ -66,6 +66,136 @@ find_editor() {
   return 1
 }
 
+# ── MCP Integration (via mcp2cli) ────────────────────────
+
+has_mcp2cli() {
+  command -v mcp2cli &>/dev/null
+}
+
+run_mcp2cli() {
+  if has_mcp2cli; then
+    mcp2cli "$@"
+  elif command -v uvx &>/dev/null; then
+    uvx mcp2cli "$@"
+  else
+    die "mcp2cli not found. Install with: pip install mcp2cli  (or: uvx mcp2cli --help)"
+  fi
+}
+
+# ── CMUX Integration ─────────────────────────────────────
+
+has_cmux() {
+  command -v cmux &>/dev/null
+}
+
+cmux_set_status() {
+  has_cmux && cmux set-status "$@" 2>/dev/null || true
+}
+
+cmux_clear_status() {
+  has_cmux && cmux clear-status "$@" 2>/dev/null || true
+}
+
+cmux_log() {
+  # Usage: cmux_log <level> <source> <message>
+  has_cmux && cmux log --level "$1" --source "$2" -- "$3" 2>/dev/null || true
+}
+
+cmux_progress() {
+  # Usage: cmux_progress <0.0-1.0> <label>
+  has_cmux && cmux set-progress "$1" --label "$2" 2>/dev/null || true
+}
+
+cmux_clear_progress() {
+  has_cmux && cmux clear-progress 2>/dev/null || true
+}
+
+cmux_notify() {
+  # Usage: cmux_notify <title> <body>
+  has_cmux && cmux notify --title "$1" --body "$2" 2>/dev/null || true
+}
+
+cmux_rename_workspace() {
+  has_cmux && cmux rename-workspace "$1" 2>/dev/null || true
+}
+
+# ── Playwright CLI Integration ────────────────────────────
+
+PLAYWRIGHT_CONFIG=".playwright/cli.config.json"
+PLAYWRIGHT_SKILLS_DIR=".claude/skills/playwright-cli"
+
+has_playwright_cli() { command -v playwright-cli &>/dev/null; }
+playwright_cli_version() { has_playwright_cli && playwright-cli --version 2>/dev/null || echo "not installed"; }
+playwright_cli_has_skills() { [ -f "$PLAYWRIGHT_SKILLS_DIR/SKILL.md" ]; }
+
+# ── Workflow Recommendations ──────────────────────────────
+
+RECOMMENDATIONS_FILE="$AGENTS_DIR/recommendations.md"
+
+_detect_project_issues() {
+  local root
+  root=$(repo_root 2>/dev/null || pwd)
+  local issues=""
+
+  # No .gitignore
+  [ ! -f "$root/.gitignore" ] && issues+="[hygiene] Add a .gitignore file"$'\n'
+
+  # No test directory
+  if [ ! -d "$root/test" ] && [ ! -d "$root/tests" ] && [ ! -d "$root/__tests__" ] && [ ! -d "$root/spec" ]; then
+    issues+="[testing] Add tests — no test directory found (test/, tests/, __tests__/, spec/)"$'\n'
+  fi
+
+  # No CI config
+  if [ ! -d "$root/.github/workflows" ] && [ ! -f "$root/.gitlab-ci.yml" ] && [ ! -f "$root/Jenkinsfile" ] && [ ! -f "$root/.circleci/config.yml" ]; then
+    issues+="[hygiene] Add CI/CD — no workflow config found"$'\n'
+  fi
+
+  # .env exists but no .env.example
+  if [ -f "$root/.env" ] && [ ! -f "$root/.env.example" ]; then
+    issues+="[security] Add .env.example for team onboarding — .env exists without a template"$'\n'
+  fi
+
+  # No lockfile but package manager config exists
+  if [ -f "$root/package.json" ] && [ ! -f "$root/package-lock.json" ] && [ ! -f "$root/yarn.lock" ] && [ ! -f "$root/pnpm-lock.yaml" ] && [ ! -f "$root/bun.lockb" ]; then
+    issues+="[hygiene] Commit lockfile — package.json found without a lockfile"$'\n'
+  fi
+  if [ -f "$root/Gemfile" ] && [ ! -f "$root/Gemfile.lock" ]; then
+    issues+="[hygiene] Commit Gemfile.lock"$'\n'
+  fi
+  if [ -f "$root/go.mod" ] && [ ! -f "$root/go.sum" ]; then
+    issues+="[hygiene] Commit go.sum"$'\n'
+  fi
+
+  # node_modules not in .gitignore
+  if [ -f "$root/package.json" ] && [ -f "$root/.gitignore" ]; then
+    if ! grep -q "node_modules" "$root/.gitignore" 2>/dev/null; then
+      issues+="[security] Add node_modules/ to .gitignore"$'\n'
+    fi
+  fi
+
+  # No README
+  if [ ! -f "$root/README.md" ] && [ ! -f "$root/readme.md" ] && [ ! -f "$root/README" ]; then
+    issues+="[docs] Add a README"$'\n'
+  fi
+
+  # AGENTS.md has _TODO: placeholders
+  if [ -f "$root/$AGENTS_MD" ] && grep -q "_TODO:" "$root/$AGENTS_MD" 2>/dev/null; then
+    issues+="[docs] Fill in AGENTS.md sections — _TODO: placeholders remain"$'\n'
+  fi
+
+  # Playwright CLI not installed
+  if ! has_playwright_cli; then
+    issues+="[tooling] Run \`agent setup\` to install Playwright CLI"$'\n'
+  fi
+
+  # CMUX not installed
+  if ! has_cmux; then
+    issues+="[tooling] Install CMUX for workspace management — https://cmux.dev"$'\n'
+  fi
+
+  printf '%s' "$issues"
+}
+
 build_handover_summary_draft() {
   local branch="$1"
   local staged_count unstaged_count untracked_count total_count
@@ -176,13 +306,19 @@ EOF
 
 cmd_init() {
   require_git
+  local force=false
+  if [ "${1:-}" = "--force" ] || [ "${1:-}" = "-f" ]; then
+    force=true
+    shift
+  fi
+
   local root
   root=$(repo_root)
   cd "$root"
 
-  if [ -d "$AGENTS_DIR" ]; then
+  if [ -d "$AGENTS_DIR" ] && [ "$force" = false ]; then
     warn "already initialized at $root/$AGENTS_DIR"
-    echo "  Run 'agent reinit' to regenerate config files."
+    echo "  Run 'agent reinit' to regenerate config files, or 'agent init --force' to start fresh."
     return 0
   fi
 
@@ -224,14 +360,60 @@ agent_files:
   - CONVENTIONS.md
 EOF
 
-  # Create AGENTS.md from template
-  _generate_agents_md "$project_name"
+  # Create AGENTS.md from template (skip if user has existing content)
+  local agents_md_kept=false
+  if [ "$force" = true ]; then
+    _generate_agents_md "$project_name"
+  elif [ -f "$AGENTS_MD" ] && [ -s "$AGENTS_MD" ] && \
+       ! grep -q '_TODO: Add project overview_' "$AGENTS_MD" 2>/dev/null; then
+    # Non-empty and not the unedited template — preserve it
+    agents_md_kept=true
+    info "Existing ${BOLD}AGENTS.md${RESET} found — keeping it."
+  else
+    _generate_agents_md "$project_name"
+  fi
 
   # Create agent config pointers
-  _create_agent_pointers
+  if [ "$force" = true ]; then
+    # Bypass merge logic — overwrite everything
+    local pointer
+    pointer=$(_agent_pointer_content)
+    for f in .cursorrules .windsurfrules .clinerules CLAUDE.md .aider.conf.yml CONVENTIONS.md; do
+      echo "$pointer" > "$f"
+    done
+    for d in .github .cosine .opencode .codex; do
+      mkdir -p "$d"
+    done
+    echo "$pointer" > .github/copilot-instructions.md
+    echo "$pointer" > .cosine/instructions.md
+    echo "$pointer" > .opencode/instructions.md
+    echo "$pointer" > .codex/instructions.md
+  else
+    _create_agent_pointers
+  fi
 
   # Install git hooks
   _install_hooks
+
+  # ── Tool detection ──
+  local tools_detected=""
+
+  if has_playwright_cli; then
+    info "Detected playwright-cli — installing skills..."
+    playwright-cli install --skills 2>/dev/null && {
+      success "Playwright CLI skills installed"
+      tools_detected+="playwright "
+    } || warn "failed to install Playwright CLI skills (non-fatal)"
+  else
+    echo -e "  ${DIM}Playwright CLI not found. Install with:${RESET} agent test install ${DIM}or${RESET} agent setup"
+  fi
+
+  if has_cmux; then
+    tools_detected+="cmux "
+    success "CMUX detected"
+  else
+    echo -e "  ${DIM}CMUX not found. Install from:${RESET} https://cmux.dev"
+  fi
 
   # Create .gitignore additions
   if [ -f .gitignore ]; then
@@ -247,7 +429,11 @@ EOF
   success "Agent handoff system initialized"
   echo ""
   echo -e "  ${BOLD}What was created:${RESET}"
-  echo -e "  ${DIM}AGENTS.md${RESET}              ← the source of truth (edit this)"
+  if [ "$agents_md_kept" = true ]; then
+    echo -e "  ${DIM}AGENTS.md${RESET}              ← kept existing (source of truth)"
+  else
+    echo -e "  ${DIM}AGENTS.md${RESET}              ← the source of truth (edit this)"
+  fi
   echo -e "  ${DIM}.agents/${RESET}               ← handovers, config, hooks"
   echo ""
   echo -e "  ${BOLD}Agent pointers (all → AGENTS.md):${RESET}"
@@ -260,11 +446,32 @@ EOF
   echo -e "  ${DIM}.opencode/instructions${RESET}  OpenCode"
   echo -e "  ${DIM}.codex/instructions${RESET}     Codex"
   echo -e "  ${DIM}.aider.conf.yml${RESET}         Aider"
+
+  if echo "$tools_detected" | grep -q "playwright"; then
+    echo ""
+    echo -e "  ${BOLD}Skills:${RESET}"
+    echo -e "  ${DIM}$PLAYWRIGHT_SKILLS_DIR${RESET}  Playwright CLI"
+  fi
+
   echo ""
   echo -e "  ${BOLD}Next steps:${RESET}"
   echo -e "  1. Edit ${BOLD}AGENTS.md${RESET} with your project context"
   echo -e "  2. Start working with ${BOLD}any${RESET} agent tool — they all read AGENTS.md"
   echo -e "  3. Run ${BOLD}agent handover${RESET} before switching to a different agent"
+
+  # ── CMUX workspace setup ──
+  if has_cmux; then
+    local branch
+    branch=$(git branch --show-current 2>/dev/null || echo "main")
+    cmux_rename_workspace "$project_name"
+    cmux_set_status "project" "$project_name" --icon "folder.fill" --color "#64B5F6"
+    cmux_set_status "branch" "$branch" --icon "arrow.triangle.branch" --color "#81C784"
+    cmux_set_status "agent" "ready" --icon "bolt.fill" --color "#FFD54F"
+    cmux_set_status "handovers" "0" --icon "doc.text.fill" --color "#B0BEC5"
+    cmux_log "success" "agent" "Initialized agent handoff for $project_name"
+    echo ""
+    success "CMUX workspace configured"
+  fi
 }
 
 cmd_handover() {
@@ -293,6 +500,10 @@ cmd_handover() {
     unstaged=$(printf '%s\n\nUntracked files:\n%s' "$unstaged" "$untracked")
   fi
 
+  # Signal handover in progress
+  cmux_set_status "agent" "handing over..." --icon "arrow.triangle.2.circlepath" --color "#FFB74D"
+  cmux_progress 0.5 "Writing handover..."
+
   # Check for arguments (non-interactive mode for agents)
   local summary=""
   local decisions=""
@@ -300,6 +511,7 @@ cmd_handover() {
   local next_steps=""
   local context=""
   local summary_draft=""
+  local recommend=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -308,6 +520,7 @@ cmd_handover() {
       --learnings|-l) learnings="$2"; shift 2 ;;
       --next|-n) next_steps="$2"; shift 2 ;;
       --context|-c) context="$2"; shift 2 ;;
+      --recommend|-r) recommend="$2"; shift 2 ;;
       --stdin) context=$(cat); shift ;;
       *) die "unknown option: $1" ;;
     esac
@@ -381,6 +594,48 @@ $context
 EOF
   fi
 
+  # Append Workflow Recommendations section
+  local auto_issues
+  auto_issues=$(_detect_project_issues)
+  if [ -n "$auto_issues" ] || [ -n "$recommend" ]; then
+    cat >> "$handover_file" << 'RECSECTION'
+
+## Workflow Recommendations
+RECSECTION
+
+    local date_str
+    date_str=$(iso_date)
+
+    # Auto-detected issues
+    if [ -n "$auto_issues" ]; then
+      while IFS= read -r rec_line; do
+        [ -z "$rec_line" ] && continue
+        echo "- **$date_str** [auto] $rec_line" >> "$handover_file"
+      done <<< "$auto_issues"
+    fi
+
+    # Agent-provided recommendation
+    if [ -n "$recommend" ]; then
+      echo "- **$date_str** [agent] $recommend" >> "$handover_file"
+    fi
+
+    # Also append to recommendations log
+    mkdir -p "$AGENTS_DIR"
+    if [ ! -f "$RECOMMENDATIONS_FILE" ]; then
+      echo "# Workflow Recommendations" > "$RECOMMENDATIONS_FILE"
+      echo "" >> "$RECOMMENDATIONS_FILE"
+    fi
+    if [ -n "$auto_issues" ]; then
+      while IFS= read -r rec_line; do
+        [ -z "$rec_line" ] && continue
+        echo "- **$date_str** [auto] $rec_line" >> "$RECOMMENDATIONS_FILE"
+      done <<< "$auto_issues"
+    fi
+    if [ -n "$recommend" ]; then
+      echo "- **$date_str** [agent] $recommend" >> "$RECOMMENDATIONS_FILE"
+    fi
+  fi
+
   # Update AGENTS.md with latest handover summary
   _update_agents_md_progress "$summary" "$learnings" "$next_steps"
 
@@ -391,6 +646,16 @@ EOF
   if [ -n "$learnings" ] && [ "$learnings" != "_No learnings or gotchas logged._" ]; then echo -e "  ${DIM}Learnings:${RESET} $learnings"; fi
   if [ -n "$next_steps" ] && [ "$next_steps" != "_No next steps logged._" ]; then echo -e "  ${DIM}Next steps:${RESET} $next_steps"; fi
   if [ -n "$context" ]; then echo -e "  ${DIM}Context:${RESET} $(echo "$context" | wc -c | tr -d ' ') bytes captured"; fi
+
+  # ── CMUX handover complete ──
+  local handover_count
+  handover_count=$(find "$HANDOVERS_DIR" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+  cmux_set_status "agent" "handed over" --icon "checkmark.circle.fill" --color "#81C784"
+  cmux_set_status "handovers" "$handover_count" --icon "doc.text.fill" --color "#B0BEC5"
+  cmux_set_status "last-handover" "$(iso_date)" --icon "clock.fill" --color "#90A4AE"
+  cmux_progress 1.0 "Handover complete"
+  cmux_log "success" "agent" "Handover: $summary"
+  cmux_notify "Agent Handover Complete" "$summary"
 }
 
 cmd_status() {
@@ -407,7 +672,7 @@ cmd_status() {
 
   # Last handover
   local latest
-  latest=$(ls -t "$HANDOVERS_DIR"/*.md 2>/dev/null | head -1)
+  latest=$(find "$HANDOVERS_DIR" -maxdepth 1 -name "*.md" 2>/dev/null | sort -r | head -1)
   if [ -n "$latest" ]; then
     local handover_name
     handover_name=$(basename "$latest" .md)
@@ -422,7 +687,7 @@ cmd_status() {
 
   # Handover count
   local count
-  count=$(ls "$HANDOVERS_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ')
+  count=$(find "$HANDOVERS_DIR" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
   echo -e "  ${BOLD}Total handovers:${RESET} $count"
 
   # Git state
@@ -441,6 +706,18 @@ cmd_status() {
   else
     echo -e "  ${BOLD}AGENTS.md:${RESET} ${RED}missing${RESET}"
   fi
+
+  # CMUX sidebar sync
+  if has_cmux; then
+    echo -e "  ${BOLD}CMUX:${RESET} ${GREEN}connected${RESET}"
+    cmux_set_status "project" "$project_name" --icon "folder.fill" --color "#64B5F6"
+    cmux_set_status "branch" "$branch" --icon "arrow.triangle.branch" --color "#81C784"
+    cmux_set_status "handovers" "$count" --icon "doc.text.fill" --color "#B0BEC5"
+    cmux_set_status "uncommitted" "$uncommitted files" --icon "pencil.circle.fill" --color "#FFB74D"
+    cmux_rename_workspace "$project_name"
+  else
+    echo -e "  ${BOLD}CMUX:${RESET} ${DIM}not available${RESET}"
+  fi
   echo ""
 }
 
@@ -451,7 +728,7 @@ cmd_log() {
   cd "$root"
 
   local handovers
-  handovers=$(ls -t "$HANDOVERS_DIR"/*.md 2>/dev/null)
+  handovers=$(find "$HANDOVERS_DIR" -maxdepth 1 -name "*.md" 2>/dev/null | sort -r)
 
   if [ -z "$handovers" ]; then
     echo -e "${DIM}No handovers yet. Run 'agent handover' to create one.${RESET}"
@@ -475,7 +752,7 @@ cmd_log() {
   done
 
   local total
-  total=$(ls "$HANDOVERS_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ')
+  total=$(find "$HANDOVERS_DIR" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
   if [ "$total" -gt "$limit" ] 2>/dev/null; then
     echo -e "\n  ${DIM}... and $((total - limit)) more${RESET}"
   fi
@@ -509,26 +786,13 @@ cmd_onboard() {
     config_path=".${lower}/instructions.md"
   fi
 
-  # Create the pointer file
-  local pointer
-  pointer=$(cat << 'POINTER'
-# Agent Instructions
-
-Read the `AGENTS.md` file in this repository root for all project context,
-architecture decisions, conventions, progress history, and handoff notes.
-
-That file is the single source of truth maintained across all agent sessions.
-Always read it at the start of a new session. Update it when you make
-significant decisions or complete major work.
-POINTER
-)
-
+  # Create the pointer file (merge with existing content if present)
   local dir
   dir=$(dirname "$config_path")
   if [ "$dir" != "." ]; then
     mkdir -p "$dir"
   fi
-  echo "$pointer" > "$config_path"
+  _write_pointer_file "$config_path"
 
   # Register in config
   echo "  - $config_path    # $name" >> "$CONFIG_FILE"
@@ -548,10 +812,722 @@ cmd_reinit() {
   root=$(repo_root)
   cd "$root"
 
-  info "Regenerating agent config files"
+  info "Regenerating agent config files (AGENTS.md untouched)"
   _create_agent_pointers
   _install_hooks
   success "Agent config files regenerated"
+}
+
+cmd_workspace() {
+  local subcmd="${1:-sync}"
+  shift 2>/dev/null || true
+
+  if ! has_cmux; then
+    die "cmux is not installed. CMUX is required for workspace management."
+  fi
+
+  case "$subcmd" in
+    name|rename)
+      local name="${1:-}"
+      if [ -z "$name" ]; then
+        require_git
+        name=$(basename "$(repo_root)")
+      fi
+      cmux_rename_workspace "$name"
+      success "Workspace renamed to: $name"
+      ;;
+    sync)
+      require_git
+      require_init
+      local root
+      root=$(repo_root)
+      cd "$root"
+
+      local project_name branch count uncommitted
+      project_name=$(basename "$root")
+      branch=$(git branch --show-current 2>/dev/null || echo "unknown")
+      count=$(find "$HANDOVERS_DIR" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+      uncommitted=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+
+      cmux_rename_workspace "$project_name"
+      cmux_set_status "project" "$project_name" --icon "folder.fill" --color "#64B5F6"
+      cmux_set_status "branch" "$branch" --icon "arrow.triangle.branch" --color "#81C784"
+      cmux_set_status "handovers" "$count" --icon "doc.text.fill" --color "#B0BEC5"
+      cmux_set_status "uncommitted" "$uncommitted files" --icon "pencil.circle.fill" --color "#FFB74D"
+      cmux_set_status "agent" "active" --icon "bolt.fill" --color "#FFD54F"
+      cmux_log "info" "agent" "Workspace synced for $project_name ($branch)"
+      success "CMUX workspace synced"
+      ;;
+    *)
+      die "unknown workspace command: $subcmd. Use 'name <title>' or 'sync'."
+      ;;
+  esac
+}
+
+cmd_peek() {
+  if ! has_cmux; then
+    die "cmux is not installed. CMUX is required for peek."
+  fi
+
+  local target="${1:-}"
+
+  if [ -z "$target" ]; then
+    # List available workspaces
+    echo -e "${BOLD}Workspaces${RESET}"
+    echo ""
+    cmux list-workspaces
+    echo ""
+    echo -e "${DIM}Usage: agent peek <workspace-ref>  (e.g. agent peek workspace:3)${RESET}"
+    return 0
+  fi
+
+  echo -e "${BOLD}Screen — $target${RESET}"
+  echo ""
+  cmux read-screen --workspace "$target" 2>/dev/null || die "could not read workspace: $target"
+}
+
+cmd_dashboard() {
+  if ! has_cmux; then
+    die "cmux is not installed. CMUX is required for dashboard."
+  fi
+
+  echo -e "${BOLD}Agent Dashboard${RESET}"
+  echo ""
+
+  local workspaces
+  workspaces=$(cmux list-workspaces 2>/dev/null)
+
+  echo "$workspaces" | while IFS= read -r line; do
+    # Extract workspace ref (first word after optional *)
+    local ref
+    ref=$(echo "$line" | sed 's/^\* *//' | awk '{print $1}')
+    local name
+    name=$(echo "$line" | sed 's/^[* ]*//' | sed "s/^$ref[[:space:]]*//" | sed 's/\[selected\]//')
+    local selected=""
+    if echo "$line" | grep -q '\[selected\]'; then
+      selected=" ${GREEN}◀${RESET}"
+    fi
+
+    # Get sidebar state for this workspace
+    local state
+    state=$(cmux sidebar-state --workspace "$ref" 2>/dev/null || echo "")
+    local branch
+    branch=$(echo "$state" | grep "^git_branch=" | cut -d= -f2)
+    local cwd
+    cwd=$(echo "$state" | grep "^cwd=" | cut -d= -f2)
+    cwd=$(basename "$cwd" 2>/dev/null || echo "$cwd")
+
+    echo -e "  ${YELLOW}$ref${RESET}  ${BOLD}$cwd${RESET}${selected}"
+    if [ -n "$branch" ] && [ "$branch" != "none" ]; then
+      echo -e "         ${DIM}branch:${RESET} $branch"
+    fi
+    if [ -n "$name" ] && [ "$name" != "$cwd" ]; then
+      echo -e "         ${DIM}title:${RESET} $(echo "$name" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')"
+    fi
+    echo ""
+  done
+}
+
+cmd_spawn() {
+  if ! has_cmux; then
+    die "cmux is not installed. CMUX is required for spawn."
+  fi
+
+  local task_desc="${1:-}"
+  if [ -z "$task_desc" ]; then
+    die "usage: agent spawn \"task description\" [--command <shell-cmd>]"
+  fi
+
+  local shell_cmd=""
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --command|-c) shell_cmd="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  # Create new workspace
+  local result
+  if [ -n "$shell_cmd" ]; then
+    result=$(cmux new-workspace --command "$shell_cmd" 2>&1)
+  else
+    result=$(cmux new-workspace 2>&1)
+  fi
+
+  if ! echo "$result" | grep -q "^OK"; then
+    die "failed to create workspace: $result"
+  fi
+
+  # Extract UUID from "OK <uuid>" response — use it directly as workspace ID
+  local ws_ref
+  ws_ref=$(echo "$result" | sed 's/^OK[[:space:]]*//')
+
+  # Name it with the task description (truncated)
+  local short_name
+  short_name=$(echo "$task_desc" | cut -c1-40)
+  cmux rename-workspace --workspace "$ws_ref" "$short_name" 2>/dev/null || true
+
+  # Set status pills on the new workspace
+  cmux set-status "task" "$task_desc" --icon "hammer.fill" --color "#FFB74D" --workspace "$ws_ref" 2>/dev/null || true
+  cmux set-status "agent" "spawned" --icon "sparkle" --color "#CE93D8" --workspace "$ws_ref" 2>/dev/null || true
+  cmux log --level info --source "agent" --workspace "$ws_ref" -- "Spawned for: $task_desc" 2>/dev/null || true
+
+  # If we're in an agent-initialized repo, cd there and show the task
+  local root
+  root=$(repo_root 2>/dev/null || echo "")
+  if [ -n "$root" ] && [ -d "$root/$AGENTS_DIR" ]; then
+    cmux send --workspace "$ws_ref" "cd $root" 2>/dev/null || true
+    cmux send-key --workspace "$ws_ref" Enter 2>/dev/null || true
+  fi
+
+  success "Spawned workspace ${BOLD}$ws_ref${RESET} — $task_desc"
+  echo ""
+  echo -e "  ${DIM}Switch to it:${RESET} cmux select-workspace --workspace $ws_ref"
+}
+
+cmd_signal() {
+  if ! has_cmux; then
+    die "cmux is not installed. CMUX is required for signal."
+  fi
+
+  local subcmd="${1:-}"
+  shift 2>/dev/null || true
+
+  case "$subcmd" in
+    send)
+      local name="${1:-}"
+      [ -z "$name" ] && die "usage: agent signal send <name>"
+      cmux wait-for --signal "$name" 2>/dev/null
+      cmux_log "info" "agent" "Signal sent: $name"
+      cmux_notify "Agent Signal" "Signal '$name' sent"
+      success "Signal sent: $name"
+      ;;
+    wait)
+      local name="${1:-}"
+      [ -z "$name" ] && die "usage: agent signal wait <name> [--timeout <seconds>]"
+      shift
+      local timeout_args=""
+      if [ "${1:-}" = "--timeout" ] && [ -n "${2:-}" ]; then
+        timeout_args="--timeout $2"
+      fi
+      info "Waiting for signal: $name..."
+      cmux_set_status "agent" "waiting: $name" --icon "hourglass" --color "#90A4AE"
+      # shellcheck disable=SC2086
+      cmux wait-for "$name" $timeout_args 2>/dev/null
+      local exit_code=$?
+      if [ $exit_code -eq 0 ]; then
+        cmux_set_status "agent" "active" --icon "bolt.fill" --color "#FFD54F"
+        success "Signal received: $name"
+      else
+        cmux_set_status "agent" "timeout" --icon "exclamationmark.triangle.fill" --color "#EF5350"
+        die "timed out waiting for signal: $name"
+      fi
+      ;;
+    *)
+      die "usage: agent signal <send|wait> <name> [--timeout <seconds>]"
+      ;;
+  esac
+}
+
+cmd_browse() {
+  if ! has_cmux; then
+    die "cmux is not installed. CMUX is required for browse."
+  fi
+
+  local url="${1:-}"
+  local snapshot="${2:-}"
+
+  if [ -z "$url" ]; then
+    die "usage: agent browse <url> [--snapshot]"
+  fi
+
+  info "Opening browser: $url"
+  local result
+  result=$(cmux browser open "$url" 2>&1)
+
+  if echo "$result" | grep -q "OK"; then
+    local surface
+    surface=$(echo "$result" | grep -o 'surface=surface:[0-9]*' | cut -d= -f2)
+    cmux_log "info" "agent" "Opened browser: $url"
+    success "Browser opened in $surface"
+
+    if [ "$snapshot" = "--snapshot" ] || [ "$snapshot" = "-s" ]; then
+      # Wait for page to load
+      cmux browser wait --load-state complete --surface "$surface" 2>/dev/null || true
+      echo ""
+      cmux browser snapshot --surface "$surface" 2>/dev/null || true
+    fi
+  else
+    die "failed to open browser: $result"
+  fi
+}
+
+cmd_context() {
+  if ! has_cmux; then
+    die "cmux is not installed. CMUX is required for context."
+  fi
+
+  local subcmd="${1:-}"
+  shift 2>/dev/null || true
+
+  case "$subcmd" in
+    push)
+      local root
+      root=$(repo_root 2>/dev/null || pwd)
+      local project_name
+      project_name=$(basename "$root")
+      local branch
+      branch=$(git branch --show-current 2>/dev/null || echo "unknown")
+
+      # Build context payload
+      local context=""
+      context+="# Agent Context — $project_name"$'\n'
+      context+="Branch: $branch"$'\n'
+      context+="Time: $(iso_date)"$'\n'
+      context+="CWD: $root"$'\n'
+      context+=""$'\n'
+
+      # Recent changes
+      local diff_stat
+      diff_stat=$(git diff --stat 2>/dev/null || echo "clean")
+      context+="## Recent Changes"$'\n'
+      context+="$diff_stat"$'\n'
+      context+=""$'\n'
+
+      # Last 5 commits
+      local commits
+      commits=$(git log --oneline -5 2>/dev/null || echo "no commits")
+      context+="## Recent Commits"$'\n'
+      context+="$commits"$'\n'
+      context+=""$'\n'
+
+      # Last handover summary if available
+      if [ -d "$HANDOVERS_DIR" ]; then
+        local latest=""
+        latest=$(find "$HANDOVERS_DIR" -name "*.md" -type f 2>/dev/null | sort -r | head -1 || true)
+        if [ -n "$latest" ]; then
+          local summary
+          summary=$(sed -n '/^## Summary$/,/^##/{/^## Summary$/d;/^##/d;p;}' "$latest" | head -3 | sed 's/^[[:space:]]*//')
+          context+="## Last Handover"$'\n'
+          context+="$summary"$'\n'
+        fi
+      fi
+
+      local buffer_name="${1:-agent-context}"
+      cmux set-buffer --name "$buffer_name" "$context" 2>/dev/null
+      cmux_log "info" "agent" "Context pushed to buffer: $buffer_name"
+      success "Context pushed to buffer: ${BOLD}$buffer_name${RESET}"
+      echo ""
+      echo -e "  ${DIM}Pull from another workspace:${RESET} agent context pull $buffer_name"
+      ;;
+    pull)
+      local buffer_name="${1:-agent-context}"
+      echo -e "${BOLD}Context — $buffer_name${RESET}"
+      echo ""
+      # paste-buffer sends to a surface, we need to read it differently
+      # Use list-buffers to check existence, then paste
+      local buffers
+      buffers=$(cmux list-buffers 2>/dev/null)
+      if echo "$buffers" | grep -q "^$buffer_name"; then
+        # Read the buffer by pasting to a temp approach - just show what we stored
+        # Actually, we need to use display-message or a workaround
+        # The cleanest way: push context also to a status entry
+        cmux paste-buffer --name "$buffer_name" 2>/dev/null
+        success "Context from '$buffer_name' pasted to current surface"
+      else
+        die "buffer '$buffer_name' not found. Available buffers:"$'\n'"$buffers"
+      fi
+      ;;
+    list)
+      echo -e "${BOLD}Available Context Buffers${RESET}"
+      echo ""
+      cmux list-buffers 2>/dev/null || echo -e "  ${DIM}No buffers${RESET}"
+      ;;
+    *)
+      die "usage: agent context <push|pull|list> [buffer-name]"
+      ;;
+  esac
+}
+
+cmd_focus() {
+  if ! has_cmux; then
+    die "cmux is not installed. CMUX is required for focus."
+  fi
+
+  local subcmd="${1:-}"
+
+  case "$subcmd" in
+    stop|done|end)
+      # Check if there's a focus file
+      local focus_file="/tmp/.agent-focus-$$"
+      # Use a workspace-scoped focus file
+      local ws_id
+      ws_id=$(cmux identify --json 2>/dev/null | grep -o '"workspace_ref" *: *"[^"]*"' | head -1 | sed 's/.*: *"//;s/"//')
+      focus_file="/tmp/.agent-focus-${ws_id:-unknown}"
+
+      if [ -f "$focus_file" ]; then
+        local start_time task_name
+        start_time=$(head -1 "$focus_file")
+        task_name=$(tail -1 "$focus_file")
+        local now
+        now=$(date +%s)
+        local elapsed=$(( now - start_time ))
+        local mins=$(( elapsed / 60 ))
+
+        cmux_set_status "focus" "$task_name (${mins}m)" --icon "checkmark.circle.fill" --color "#81C784"
+        cmux_log "success" "agent" "Focus complete: $task_name (${mins}m)"
+        cmux_notify "Focus Complete" "$task_name — ${mins} minutes"
+        rm -f "$focus_file"
+
+        # Clear focus after a moment
+        cmux_clear_status "focus"
+        success "Focus ended: ${BOLD}$task_name${RESET} (${mins}m)"
+      else
+        warn "no active focus session"
+      fi
+      ;;
+    "")
+      die "usage: agent focus \"task name\" | agent focus stop"
+      ;;
+    *)
+      # Start focus mode
+      local task_name="$subcmd"
+      # Combine remaining args
+      shift
+      if [ $# -gt 0 ]; then
+        task_name="$task_name $*"
+      fi
+
+      local ws_id
+      ws_id=$(cmux identify --json 2>/dev/null | grep -o '"workspace_ref" *: *"[^"]*"' | head -1 | sed 's/.*: *"//;s/"//')
+      local focus_file="/tmp/.agent-focus-${ws_id:-unknown}"
+
+      # Store start time and task
+      date +%s > "$focus_file"
+      echo "$task_name" >> "$focus_file"
+
+      cmux_set_status "focus" "$task_name" --icon "scope" --color "#FFD54F"
+      cmux_set_status "agent" "focused" --icon "eye.fill" --color "#64B5F6"
+      cmux_log "info" "agent" "Focus started: $task_name"
+
+      success "Focus started: ${BOLD}$task_name${RESET}"
+      echo -e "  ${DIM}End with:${RESET} agent focus stop"
+      ;;
+  esac
+}
+
+cmd_test() {
+  local subcmd="${1:-}"
+
+  if [ -z "$subcmd" ]; then
+    die "usage: agent test <url> [--headed] [--parallel N] [--session <name>]
+       agent test install"
+  fi
+
+  if [ "$subcmd" = "install" ]; then
+    _test_install
+    return $?
+  fi
+
+  # It's a URL — run test
+  _test_run "$@"
+}
+
+_test_install() {
+  info "Installing Playwright CLI"
+
+  if ! command -v npm &>/dev/null; then
+    die "npm is required to install Playwright CLI. Install Node.js first."
+  fi
+
+  echo ""
+  info "Installing @playwright/cli globally..."
+  npm install -g @playwright/cli@latest || die "failed to install @playwright/cli"
+  success "Playwright CLI installed"
+
+  echo ""
+  info "Installing browsers..."
+  playwright-cli install || die "failed to install browsers"
+  success "Browsers installed"
+
+  echo ""
+  info "Installing Claude Code skills..."
+  playwright-cli install --skills || warn "failed to install skills (non-fatal)"
+  success "Playwright CLI setup complete"
+
+  echo ""
+  echo -e "  ${BOLD}Installed:${RESET}"
+  echo -e "  ${DIM}playwright-cli${RESET}  $(playwright_cli_version)"
+  echo -e "  ${DIM}browsers${RESET}        chromium, firefox, webkit"
+  if playwright_cli_has_skills; then
+    echo -e "  ${DIM}skills${RESET}          $PLAYWRIGHT_SKILLS_DIR"
+  fi
+  echo ""
+  echo -e "  ${BOLD}Try it:${RESET} agent test https://example.com --headed"
+}
+
+_test_run() {
+  if ! has_playwright_cli; then
+    die "playwright-cli is not installed. Run 'agent test install' first."
+  fi
+
+  local url="$1"
+  shift
+
+  local headed=false
+  local parallel=0
+  local session=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --headed)    headed=true; shift ;;
+      --parallel)  parallel="$2"; shift 2 ;;
+      --session|-s) session="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  if [ "$parallel" -gt 0 ] 2>/dev/null; then
+    _test_run_parallel "$url" "$parallel" "$headed"
+  else
+    _test_run_single "$url" "$headed" "$session"
+  fi
+}
+
+_test_run_single() {
+  local url="$1"
+  local headed="$2"
+  local session="$3"
+
+  local args=()
+  args+=("open" "$url")
+
+  if [ "$headed" = "true" ]; then
+    args+=("--headed")
+  fi
+
+  if [ -n "$session" ]; then
+    args+=("-s=$session")
+  fi
+
+  info "Opening Playwright session: $url"
+  cmux_set_status "test" "testing: $url" --icon "globe" --color "#64B5F6"
+  cmux_log "info" "agent" "Playwright test: $url"
+
+  playwright-cli "${args[@]}"
+}
+
+_test_run_parallel() {
+  local url="$1"
+  local count="$2"
+  local headed="$3"
+
+  if ! has_cmux; then
+    die "cmux is required for parallel test sessions. Install CMUX first."
+  fi
+
+  info "Spawning $count parallel test sessions for $url"
+  echo ""
+
+  local i
+  for i in $(seq 1 "$count"); do
+    local session_name="test-$i"
+    local cmd="playwright-cli open $url -s=$session_name"
+    if [ "$headed" = "true" ]; then
+      cmd="$cmd --headed"
+    fi
+
+    local result
+    result=$(cmux new-workspace --command "$cmd" 2>&1)
+
+    if echo "$result" | grep -q "^OK"; then
+      local ws_ref
+      ws_ref=$(echo "$result" | sed 's/^OK[[:space:]]*//')
+      cmux rename-workspace --workspace "$ws_ref" "test-$i" 2>/dev/null || true
+      cmux set-status "test" "$session_name: $url" --icon "globe" --color "#64B5F6" --workspace "$ws_ref" 2>/dev/null || true
+      success "Session $session_name → workspace $ws_ref"
+    else
+      warn "Failed to spawn session $session_name: $result"
+    fi
+  done
+
+  echo ""
+  success "Spawned $count parallel test sessions"
+  echo -e "  ${DIM}View all:${RESET} agent dashboard"
+}
+
+cmd_setup() {
+  echo -e "${BOLD}Agent Global Tool Setup${RESET}"
+  echo ""
+
+  # Check npm
+  if command -v npm &>/dev/null; then
+    local npm_ver
+    npm_ver=$(npm --version 2>/dev/null)
+    success "npm $npm_ver"
+  else
+    warn "npm not found — needed to install global tools"
+    echo -e "  ${DIM}Install Node.js: https://nodejs.org${RESET}"
+    echo ""
+  fi
+
+  # Check cmux
+  if has_cmux; then
+    success "cmux $(cmux --version 2>/dev/null || echo "installed")"
+  else
+    warn "cmux not found — needed for workspace management and parallel sessions"
+    echo -e "  ${DIM}Install CMUX: https://cmux.dev${RESET}"
+  fi
+
+  # Check playwright-cli
+  if has_playwright_cli; then
+    success "playwright-cli $(playwright_cli_version)"
+    if playwright_cli_has_skills; then
+      success "playwright-cli skills installed"
+    else
+      echo ""
+      echo -e "  ${DIM}Skills not installed. Install with:${RESET} playwright-cli install --skills"
+    fi
+  else
+    warn "playwright-cli not found — needed for browser testing"
+    if command -v npm &>/dev/null; then
+      echo ""
+      printf '  Install playwright-cli now? [y/N]: '
+      read -r answer
+      if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
+        echo ""
+        _test_install
+      else
+        echo -e "  ${DIM}Install later:${RESET} agent test install"
+      fi
+    else
+      echo -e "  ${DIM}Install npm first, then:${RESET} agent test install"
+    fi
+  fi
+
+  # Check mcp2cli
+  if has_mcp2cli; then
+    success "mcp2cli $(mcp2cli --version 2>/dev/null || echo "installed")"
+  elif command -v uvx &>/dev/null; then
+    success "mcp2cli available via uvx"
+  else
+    warn "mcp2cli not found — needed for agent mcp (MCP server bridge)"
+    echo -e "  ${DIM}Install with: pip install mcp2cli  (or use uvx)${RESET}"
+  fi
+
+  echo ""
+  echo -e "${BOLD}Tool Summary${RESET}"
+  echo ""
+  printf '  %-20s %s\n' "agent CLI" "$(command -v agent &>/dev/null && echo "${GREEN}available${RESET}" || echo "${YELLOW}current script${RESET}")"
+  printf '  %-20s %s\n' "cmux" "$(has_cmux && echo -e "${GREEN}available${RESET}" || echo -e "${DIM}not installed${RESET}")"
+  printf '  %-20s %s\n' "playwright-cli" "$(has_playwright_cli && echo -e "${GREEN}available${RESET}" || echo -e "${DIM}not installed${RESET}")"
+  printf '  %-20s %s\n' "mcp2cli" "$(has_mcp2cli && echo -e "${GREEN}available${RESET}" || (command -v uvx &>/dev/null && echo -e "${GREEN}via uvx${RESET}" || echo -e "${DIM}not installed${RESET}"))"
+  echo ""
+}
+
+cmd_recommend() {
+  require_init
+  local root
+  root=$(repo_root)
+  cd "$root"
+
+  local suggestion=""
+  local category="general"
+  local auto_only=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --auto)       auto_only=true; shift ;;
+      --category|-c) category="$2"; shift 2 ;;
+      *)            suggestion="$1"; shift ;;
+    esac
+  done
+
+  # If a suggestion was provided, log it
+  if [ -n "$suggestion" ]; then
+    mkdir -p "$AGENTS_DIR"
+    local date_str
+    date_str=$(iso_date)
+    if [ ! -f "$RECOMMENDATIONS_FILE" ]; then
+      echo "# Workflow Recommendations" > "$RECOMMENDATIONS_FILE"
+      echo "" >> "$RECOMMENDATIONS_FILE"
+    fi
+    echo "- **$date_str** [$category] $suggestion" >> "$RECOMMENDATIONS_FILE"
+    success "Recommendation logged: [$category] $suggestion"
+    return 0
+  fi
+
+  # Show recommendations
+  echo -e "${BOLD}Workflow Recommendations${RESET}"
+  echo ""
+
+  # Auto-detected issues
+  local auto_issues
+  auto_issues=$(_detect_project_issues)
+
+  if [ -n "$auto_issues" ]; then
+    echo -e "  ${BOLD}Auto-detected issues:${RESET}"
+    echo ""
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      echo -e "  ${YELLOW}!${RESET} $line"
+    done <<< "$auto_issues"
+    echo ""
+  else
+    echo -e "  ${GREEN}✓${RESET} No auto-detected issues"
+    echo ""
+  fi
+
+  if [ "$auto_only" = true ]; then
+    return 0
+  fi
+
+  # Logged recommendations
+  if [ -f "$RECOMMENDATIONS_FILE" ]; then
+    local logged
+    logged=$(grep "^- " "$RECOMMENDATIONS_FILE" 2>/dev/null || true)
+    if [ -n "$logged" ]; then
+      echo -e "  ${BOLD}Logged recommendations:${RESET}"
+      echo ""
+      while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        echo -e "  $line"
+      done <<< "$logged"
+      echo ""
+    fi
+  else
+    echo -e "  ${DIM}No logged recommendations yet.${RESET}"
+    echo -e "  ${DIM}Log one with: agent recommend \"your suggestion\"${RESET}"
+    echo ""
+  fi
+}
+
+cmd_mcp() {
+  if [ $# -eq 0 ]; then
+    cat << 'MCPEOF'
+  agent mcp — Call MCP server tools as CLI commands (via mcp2cli)
+
+  USAGE
+
+    agent mcp --mcp <url> --list                   List tools on an HTTP MCP server
+    agent mcp --mcp <url> <tool> [--arg value]     Call a tool on an HTTP MCP server
+    agent mcp --mcp-stdio "<cmd>" --list            List tools on a stdio MCP server
+    agent mcp --mcp-stdio "<cmd>" <tool> [args]     Call a tool on a stdio MCP server
+
+  EXAMPLES
+
+    agent mcp --mcp http://localhost:3000 --list
+    agent mcp --mcp http://localhost:3000 search --query "hello"
+    agent mcp --mcp-stdio "npx @modelcontextprotocol/server-filesystem /tmp" --list
+    agent mcp --mcp-stdio "npx @modelcontextprotocol/server-filesystem /tmp" read_file --path /tmp/foo.txt
+    agent mcp --mcp http://localhost:3000 --pretty tool-name --arg value
+
+  All flags are passed through to mcp2cli. See: mcp2cli --help
+MCPEOF
+    return 0
+  fi
+  run_mcp2cli "$@"
 }
 
 cmd_help() {
@@ -575,6 +1551,47 @@ cmd_help() {
     agent onboard <name> [path]   Register a new/unknown agent tool
     agent reinit                  Regenerate config files and hooks
 
+  CMUX COMMANDS (require CMUX terminal multiplexer)
+
+    agent workspace sync          Sync CMUX sidebar with repo state
+    agent ws name "title"         Rename the CMUX workspace
+    agent peek [workspace:N]      Read another workspace's screen
+    agent dashboard               Show all workspaces at a glance
+    agent spawn "task"            Spin up a new workspace for a task
+    agent signal send <name>      Send a signal to other agents
+    agent signal wait <name>      Wait for a signal from another agent
+    agent browse <url>            Open URL in CMUX browser split
+    agent context push [name]     Push repo context to shared buffer
+    agent context pull [name]     Pull context from shared buffer
+    agent focus "task name"       Start focus mode with timer
+    agent focus stop              End focus mode, show elapsed time
+
+  TESTING (requires Playwright CLI)
+
+    agent test <url>              Open Playwright browser session
+    agent test <url> --headed     Visible browser window
+    agent test <url> --parallel N Spawn N parallel test sessions
+    agent test <url> --session S  Use a named session
+    agent test install            Install Playwright CLI + browsers + skills
+
+  MCP (call any MCP server as CLI commands)
+
+    agent mcp --mcp <url> --list            List tools from an HTTP MCP server
+    agent mcp --mcp <url> <tool> [args]     Call a tool
+    agent mcp --mcp-stdio "<cmd>" --list    List tools from a stdio MCP server
+    agent mcp --mcp-stdio "<cmd>" <tool>    Call a tool on a stdio server
+
+  RECOMMENDATIONS
+
+    agent recommend               Show auto-detected + logged recommendations
+    agent recommend "suggestion"  Log a workflow recommendation
+    agent recommend --auto        Run auto-detection only
+    agent recommend --category C  Set category (tooling/testing/docs/security/hygiene)
+
+  GLOBAL SETUP
+
+    agent setup                   Check/install global tools
+
   HANDOVER OPTIONS
 
     agent handover --summary "what was done"         -s for short
@@ -582,6 +1599,7 @@ cmd_help() {
     agent handover --learnings "gotchas to know"    -l for short
     agent handover --next "what to do next"         -n for short
     agent handover --context "conversation dump"    -c for short
+    agent handover --recommend "improve X"           -r for short
     agent handover --stdin                           read context from stdin
 
   EXAMPLES
@@ -698,19 +1716,106 @@ agent handover            # Log progress (interactive)
 agent handover -s "..." -d "..." -l "..." -n "..."  # Log progress (non-interactive)
 agent log                 # View handover history
 agent onboard <name>      # Register a new agent tool
+agent ws sync             # Sync CMUX sidebar with repo state
 ```
 
 Detailed handover logs are in `.agents/handovers/`.
+
+## CMUX Integration
+
+If running inside [CMUX](https://cmux.dev), use these commands for real-time visibility:
+
+### Status updates (sidebar pills)
+```bash
+# Show what you're working on
+cmux set-status "task" "Implementing auth" --icon "hammer.fill" --color "#FFB74D"
+
+# Track progress on long operations
+cmux set-progress 0.5 --label "Running test suite..."
+cmux set-progress 1.0 --label "Tests passed"
+
+# Mark completion
+cmux set-status "task" "Auth complete" --icon "checkmark.circle.fill" --color "#81C784"
+cmux clear-progress
+```
+
+### Logging (sidebar log panel)
+```bash
+cmux log --level info --source "agent" -- "Starting migration refactor"
+cmux log --level success --source "agent" -- "All tests passing"
+cmux log --level warning --source "agent" -- "Deprecated API found"
+cmux log --level error --source "agent" -- "Build failed"
+```
+
+### Notifications (on major milestones)
+```bash
+cmux notify --title "Task Complete" --body "Auth system implemented and tested"
+```
+
+### Guidelines for agents
+- Update `cmux set-status "task"` when starting a new logical task
+- Use `cmux set-progress` during long operations (builds, large refactors)
+- Use `cmux log` for significant events, not every small step
+- Use `cmux notify` only for major milestones
+- Always guard with `command -v cmux &>/dev/null` — skip silently if unavailable
+
+## Playwright CLI (UI Testing)
+
+If [Playwright CLI](https://playwright.dev/) is available, use it for browser automation and UI testing. It's ~4x more token-efficient than MCP — saves accessibility tree to disk and sends only a summary.
+
+### Quick reference
+```bash
+playwright-cli open <url>               # Open a browser session
+playwright-cli open <url> --headed      # Visible browser window
+playwright-cli snapshot                  # Get accessibility tree snapshot
+playwright-cli fill "input#email" "test@example.com"  # Fill a form field
+playwright-cli click "Submit"            # Click an element (use snapshot refs)
+playwright-cli screenshot                # Take a screenshot
+playwright-cli close                     # Close the session
+```
+
+### Named sessions (for parallel testing)
+```bash
+playwright-cli open https://example.com -s=session-1
+playwright-cli open https://example.com -s=session-2
+playwright-cli snapshot -s=session-1     # Snapshot a specific session
+```
+
+### Agent CLI wrappers
+```bash
+agent test <url>              # Open Playwright session
+agent test <url> --headed     # Visible browser
+agent test <url> --parallel 3 # Spawn 3 parallel CMUX workspaces with named sessions
+agent test <url> --session S  # Use a named session
+agent test install            # Install Playwright CLI + browsers + skills
+```
+
+### Guidelines for agents
+- Use `playwright-cli snapshot` to get element references before `click` or `fill`
+- Always guard with `command -v playwright-cli &>/dev/null` — skip silently if unavailable
+- Prefer `agent test` wrappers for CMUX-integrated testing
+- Use named sessions (`-s=name`) when running multiple browsers in parallel
+
+## Workflow Recommendations
+
+Agents: when you notice friction, missing tooling, or improvement opportunities,
+log them with `agent recommend "your suggestion"` or include `--recommend` in your
+handover. Categories: tooling, testing, docs, security, hygiene.
+
+Auto-detected issues are surfaced during `agent handover` and `agent recommend`.
+
+## Available Tools Summary
+
+| Tool | Purpose | Check |
+|------|---------|-------|
+| `agent` CLI | Handoffs, status, spawn, signals | Always available |
+| CMUX | Workspace mgmt, browser, sidebar | `command -v cmux` |
+| Playwright CLI | UI testing, form filling, screenshots | `command -v playwright-cli` |
 AGENTS_TEMPLATE
 }
 
-_create_agent_pointers() {
-  # Every AI coding agent reads a different config file.
-  # We create ALL of them, each pointing to AGENTS.md as the single source of truth.
-  # This means you can switch between any agent tool and they all get the same context.
-
-  local pointer
-  pointer=$(cat << 'POINTER'
+_agent_pointer_content() {
+  cat << 'POINTER'
 # Agent Instructions
 
 Read the `AGENTS.md` file in this repository root for all project context,
@@ -719,45 +1824,85 @@ architecture decisions, conventions, progress history, and handoff notes.
 That file is the single source of truth maintained across all agent sessions.
 Always read it at the start of a new session. Update it when you make
 significant decisions or complete major work.
+
+If running inside CMUX, use `cmux set-status`, `cmux log`, and `cmux notify`
+to provide real-time progress visibility. See AGENTS.md for details.
+
+For UI testing, use `agent test <url>` or `playwright-cli` directly.
+See AGENTS.md for Playwright CLI commands.
+
+If you notice workflow friction, log it with `agent recommend "suggestion"`.
 POINTER
-)
+}
+
+# Write a pointer file, merging with existing content if present.
+# If the file already contains "Read the `AGENTS.md` file" it's ours — overwrite.
+# If the file exists with other content, prepend pointer + append original under
+# "## Previous Instructions".
+# If the file doesn't exist, create it.
+_write_pointer_file() {
+  local filepath="$1"
+  local pointer
+  pointer=$(_agent_pointer_content)
+
+  if [ -f "$filepath" ]; then
+    local existing
+    existing=$(cat "$filepath")
+
+    if echo "$existing" | grep -q 'Read the `AGENTS.md` file'; then
+      # Already a pointer from a previous init — overwrite
+      echo "$pointer" > "$filepath"
+    else
+      # Existing non-pointer content — merge
+      warn "Existing ${BOLD}${filepath}${RESET} found — merging with agent pointer"
+      printf '%s\n\n---\n\n## Previous Instructions\n\n%s\n' "$pointer" "$existing" > "$filepath"
+    fi
+  else
+    echo "$pointer" > "$filepath"
+  fi
+}
+
+_create_agent_pointers() {
+  # Every AI coding agent reads a different config file.
+  # We create ALL of them, each pointing to AGENTS.md as the single source of truth.
+  # This means you can switch between any agent tool and they all get the same context.
 
   # ── IDE agents ──────────────────────────────────────────
   # Cursor
-  echo "$pointer" > .cursorrules
+  _write_pointer_file .cursorrules
 
   # Windsurf
-  echo "$pointer" > .windsurfrules
+  _write_pointer_file .windsurfrules
 
   # Cline (VS Code extension)
-  echo "$pointer" > .clinerules
+  _write_pointer_file .clinerules
 
   # GitHub Copilot
   mkdir -p .github
-  echo "$pointer" > .github/copilot-instructions.md
+  _write_pointer_file .github/copilot-instructions.md
 
   # ── Terminal agents ─────────────────────────────────────
   # Claude Code
-  echo "$pointer" > CLAUDE.md
+  _write_pointer_file CLAUDE.md
 
   # Cosine (cos2)
   mkdir -p .cosine
-  echo "$pointer" > .cosine/instructions.md
+  _write_pointer_file .cosine/instructions.md
 
   # OpenCode
   mkdir -p .opencode
-  echo "$pointer" > .opencode/instructions.md
+  _write_pointer_file .opencode/instructions.md
 
   # Codex (OpenAI)
   mkdir -p .codex
-  echo "$pointer" > .codex/instructions.md
+  _write_pointer_file .codex/instructions.md
 
   # Aider
-  echo "$pointer" > .aider.conf.yml
+  _write_pointer_file .aider.conf.yml
 
   # ── Generic ─────────────────────────────────────────────
   # Some agents look for these
-  echo "$pointer" > CONVENTIONS.md
+  _write_pointer_file CONVENTIONS.md
 }
 
 _install_hooks() {
@@ -779,7 +1924,7 @@ fi
 
 # Check if there's a recent handover (within last 10 minutes)
 if [ -d "$HANDOVERS_DIR" ]; then
-  latest=$(ls -t "$HANDOVERS_DIR"/*.md 2>/dev/null | head -1)
+  latest=$(find "$HANDOVERS_DIR" -maxdepth 1 -name "*.md" 2>/dev/null | sort -r | head -1)
   if [ -n "$latest" ]; then
     # Get file modification time
     if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -831,13 +1976,24 @@ if [ ! -d "$AGENTS_DIR" ]; then
   exit 0
 fi
 
-latest=$(ls -t "$HANDOVERS_DIR"/*.md 2>/dev/null | head -1)
+latest=$(find "$HANDOVERS_DIR" -maxdepth 1 -name "*.md" 2>/dev/null | sort -r | head -1)
 if [ -n "$latest" ]; then
   hash=$(git rev-parse --short HEAD 2>/dev/null)
   msg=$(git log --oneline -1 2>/dev/null)
   echo "" >> "$latest"
   echo "## Commit" >> "$latest"
   echo "\`$msg\`" >> "$latest"
+fi
+
+# ── CMUX sidebar update on commit ──
+if command -v cmux &>/dev/null; then
+  branch=$(git branch --show-current 2>/dev/null || echo "unknown")
+  uncommitted=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  msg=$(git log --oneline -1 2>/dev/null)
+  cmux set-status "branch" "$branch" --icon "arrow.triangle.branch" --color "#81C784" 2>/dev/null || true
+  cmux set-status "uncommitted" "$uncommitted files" --icon "pencil.circle.fill" --color "#FFB74D" 2>/dev/null || true
+  cmux set-status "last-commit" "$msg" --icon "checkmark.seal.fill" --color "#81C784" 2>/dev/null || true
+  cmux log --level success --source "git" -- "Committed: $msg" 2>/dev/null || true
 fi
 
 exit 0
@@ -931,6 +2087,18 @@ case "${1:-help}" in
   log)        shift; cmd_log "$@" ;;
   onboard)    shift; cmd_onboard "$@" ;;
   reinit)     shift; cmd_reinit "$@" ;;
+  workspace|ws) shift; cmd_workspace "$@" ;;
+  peek)         shift; cmd_peek "$@" ;;
+  dashboard)    shift; cmd_dashboard "$@" ;;
+  spawn)        shift; cmd_spawn "$@" ;;
+  signal)       shift; cmd_signal "$@" ;;
+  browse)       shift; cmd_browse "$@" ;;
+  context|ctx)  shift; cmd_context "$@" ;;
+  focus)        shift; cmd_focus "$@" ;;
+  test)         shift; cmd_test "$@" ;;
+  recommend|rec) shift; cmd_recommend "$@" ;;
+  mcp)          shift; cmd_mcp "$@" ;;
+  setup)        shift; cmd_setup "$@" ;;
   help|--help|-h) cmd_help ;;
   version|--version|-v) echo "agent $VERSION" ;;
   *) die "unknown command: $1. Run 'agent help' for usage." ;;

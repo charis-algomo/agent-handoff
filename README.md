@@ -47,6 +47,7 @@ my-project/
 ├── .agents/
 │   ├── config.yaml                ← project config
 │   ├── handovers/                 ← timestamped handover logs
+│   ├── recommendations.md         ← workflow recommendations log
 │   └── hooks/                     ← hook templates
 │
 │  Agent pointers (auto-generated, all say "read AGENTS.md"):
@@ -74,6 +75,31 @@ Every agent tool reads its own config file. They all point to `AGENTS.md`. One s
 | `agent log` | Show recent handover entries |
 | `agent onboard <name> [path]` | Register a new/unknown agent tool |
 | `agent reinit` | Regenerate all config/pointer files |
+| `agent recommend` | Show or log workflow recommendations |
+| `agent setup` | Check/install global tools |
+
+### CMUX commands (require [CMUX](https://cmux.dev))
+
+| Command | What it does |
+|---------|-------------|
+| `agent workspace sync` | Sync CMUX sidebar with repo state |
+| `agent ws name "title"` | Rename the CMUX workspace |
+| `agent peek [workspace:N]` | Read another workspace's screen |
+| `agent dashboard` | Show all workspaces at a glance |
+| `agent spawn "task"` | Spin up a new workspace for a task |
+| `agent signal send/wait <name>` | Send/wait for signals between agents |
+| `agent browse <url>` | Open URL in CMUX browser split |
+| `agent context push/pull [name]` | Share context between workspaces |
+| `agent focus "task"` | Start focus mode with timer |
+
+### Testing commands (require [Playwright CLI](https://playwright.dev/))
+
+| Command | What it does |
+|---------|-------------|
+| `agent test <url>` | Open Playwright browser session |
+| `agent test <url> --headed` | Visible browser window |
+| `agent test <url> --parallel N` | Spawn N parallel test sessions |
+| `agent test install` | Install Playwright CLI + browsers |
 
 ## Handover options
 
@@ -83,7 +109,10 @@ agent handover
 
 # Non-interactive (for scripts and agents)
 agent handover --summary "what was done"
-agent handover -s "summary" -d "decisions" -n "next steps"
+agent handover -s "summary" -d "decisions" -l "learnings" -n "next steps"
+
+# Include a workflow recommendation
+agent handover -s "Built auth" -r "Add rate limiting to login endpoint"
 
 # Pipe conversation context
 cat conversation.txt | agent handover -s "Debugging session"
@@ -91,6 +120,26 @@ cat conversation.txt | agent handover -s "Debugging session"
 # Agent dumps its context
 agent handover -s "Auth refactor" --context "full conversation text..."
 ```
+
+## Workflow recommendations
+
+Agents notice things humans miss — missing tests, slow patterns, missing tooling. The recommendations system captures these observations.
+
+```bash
+# Show auto-detected issues + logged recommendations
+agent recommend
+
+# Log a recommendation
+agent recommend "Use bun instead of npm for faster installs"
+agent recommend --category tooling "Add biome for linting"
+
+# Run auto-detection only
+agent recommend --auto
+```
+
+Auto-detection checks for: missing `.gitignore`, no test directory, no CI config, missing `.env.example`, uncommitted lockfiles, `node_modules` not gitignored, no README, unfilled AGENTS.md placeholders, and missing tools.
+
+Recommendations are also auto-appended to handover files and stored in `.agents/recommendations.md`.
 
 ## How it works
 
@@ -152,7 +201,9 @@ The current agent should draft the handover before ending its session, and a hum
 
 - In interactive mode, `agent handover` drafts a handover from the current repo state, then lets the human review, edit, and accept it.
 - In non-interactive mode, pass `-s`, `-d`, `-l`, and `-n` directly from the agent.
-- Use the learnings / gotchas field to record anything the next agent should know, such as sharp edges, environment quirks, failed approaches, or assumptions hidden in the code.
+- Use the learnings / gotchas field (`-l`) to record anything the next agent should know, such as sharp edges, environment quirks, failed approaches, or assumptions hidden in the code.
+- Use `--recommend` / `-r` to attach a workflow recommendation that gets logged to `.agents/recommendations.md`.
+- Auto-detected project issues are appended to every handover file automatically.
 - If you want to attach a conversation dump, pass `--context` or pipe it through stdin.
 
 ## Philosophy
