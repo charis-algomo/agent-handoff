@@ -138,3 +138,44 @@ Generated in downstream repos when running `agent init`:
   - `onboard` prompt text suggests one default path, while implementation defaults to `.<name>/instructions.md` (lowercased).
 - **Testing gap:**
   - No automated test suite or CI makes regressions in shell behavior more likely during future edits.
+
+## Conversation Sources
+
+### 2026-03-14 16:57 UTC
+- **Claude Code** (conversations): `/Users/charis/.claude/projects/-Users-charis-src-agent-git`
+- **Cosine** (conversations): `/Users/charis/.cosine/sessions/2026/03/09/cli_02j00ecfnna6`
+
+### 2026-03-14 16:36 UTC
+- **Claude Code** (conversations): `/Users/charis/.claude/projects/-Users-charis-src-agent-git`
+- **Cosine** (conversations): `/Users/charis/.cosine/sessions/2026/03/09/cli_02j00ecfnna6`
+
+### 2026-03-14 16:35 UTC
+- **Claude Code** (conversations): `/Users/charis/.claude/projects/-Users-charis-src-agent-git`
+- **Cosine** (conversations): `/Users/charis/.cosine/sessions/2026/03/09/cli_02j00ecfnna6`
+
+### 2026-03-14 16:35 UTC
+- **Claude Code** (conversations): `/Users/charis/.claude/projects/-Users-charis-src-agent-git`
+- **Cosine** (conversations): `/Users/charis/.cosine/sessions/2026/03/09/cli_02j00ecfnna6`
+
+### 2026-03-14 16:35 UTC
+- **Claude Code** (conversations): `/Users/charis/.claude/projects/-Users-charis-src-agent-git`
+- **Cosine** (conversations): `/Users/charis/.cosine/sessions/2026/03/09/cli_02j00ecfnna6`
+
+### 2026-03-14 16:19 UTC
+- **Claude Code** (conversations): `/Users/charis/.claude/projects/-Users-charis-src-agent-git`
+
+### 2026-03-14 16:19 UTC
+- **Claude Code** (conversations): `/Users/charis/.claude/projects/-Users-charis-src-agent-git`
+
+### 2026-03-14 16:18 UTC
+- **Claude Code** (conversations): `/Users/charis/.claude/projects/-Users-charis-src-agent-git`
+
+### 2026-03-14 16:18 UTC
+- **Claude Code** (conversations): `/Users/charis/.claude/projects/-Users-charis-src-agent-git`
+
+### 2026-03-14 16:18 UTC
+- **Claude Code** (conversations): `/Users/charis/.claude/projects/-Users-charis-src-agent-git`
+
+### 2026-03-14 16:18 UTC
+- **Claude Code** (conversations): `/Users/charis/.claude/projects/-Users-charis-src-agent-git`
+

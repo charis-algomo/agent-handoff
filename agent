@@ -132,6 +132,139 @@ playwright_cli_has_skills() { [ -f "$PLAYWRIGHT_SKILLS_DIR/SKILL.md" ]; }
 
 RECOMMENDATIONS_FILE="$AGENTS_DIR/recommendations.md"
 
+# ── Conversation Source Detection ─────────────────────────
+
+_claude_code_project_dir() {
+  # Claude Code stores per-project data at ~/.claude/projects/<encoded-path>/
+  # where <encoded-path> is the absolute repo root with / replaced by -
+  local root="$1"
+  local encoded
+  encoded=$(echo "$root" | sed 's|/|-|g')
+  local dir="$HOME/.claude/projects/$encoded"
+  [ -d "$dir" ] && echo "$dir" || echo ""
+}
+
+_detect_conversation_sources() {
+  # Auto-detect file-accessible conversation and memory storage for known tools.
+  # Outputs lines of: TOOL_NAME<tab>TYPE<tab>PATH
+  # Tools with opaque storage (Cursor, Windsurf, Copilot, Cline) are skipped.
+  local root="$1"
+  local sources=""
+
+  # Claude Code — conversations (JSONL files) and memory
+  local claude_dir
+  claude_dir=$(_claude_code_project_dir "$root")
+  if [ -n "$claude_dir" ]; then
+    sources+="Claude Code	conversations	$claude_dir"$'\n'
+    if [ -d "$claude_dir/memory" ]; then
+      sources+="Claude Code	memory	$claude_dir/memory/"$'\n'
+    fi
+  fi
+
+  # Aider — chat history in project dir
+  if [ -f "$root/.aider.chat.history.md" ]; then
+    sources+="Aider	conversations	$root/.aider.chat.history.md"$'\n'
+  fi
+
+  # Aider — input history
+  if [ -f "$root/.aider.input.history" ]; then
+    sources+="Aider	input_history	$root/.aider.input.history"$'\n'
+  fi
+
+  # Cosine — session data stored in ~/.cosine/sessions/ indexed by sessions.json
+  local cosine_sessions_json="$HOME/.cosine/sessions.json"
+  if [ -f "$cosine_sessions_json" ]; then
+    # Find sessions matching this project's cwd
+    local cosine_session_dir
+    cosine_session_dir=$(python3 -c "
+import json, os
+with open('$cosine_sessions_json') as f:
+    data = json.load(f)
+sessions = [s for s in data.get('sessions', []) if s.get('cwd','').rstrip('/') == '$root'.rstrip('/')]
+if sessions:
+    # Most recent session (first in list, they're sorted newest first)
+    latest = sessions[0]
+    path = latest.get('path', '')
+    if path and os.path.isdir(path):
+        print(path)
+" 2>/dev/null || true)
+    if [ -n "$cosine_session_dir" ]; then
+      sources+="Cosine	conversations	$cosine_session_dir"$'\n'
+    fi
+  fi
+
+  # OpenCode — project-local storage
+  if [ -d "$root/.opencode" ] && [ "$(find "$root/.opencode" -type f ! -name 'instructions.md' 2>/dev/null | head -1)" ]; then
+    sources+="OpenCode	data	$root/.opencode/"$'\n'
+  fi
+
+  # Codex — project-local storage
+  if [ -d "$root/.codex" ] && [ "$(find "$root/.codex" -type f ! -name 'instructions.md' 2>/dev/null | head -1)" ]; then
+    sources+="Codex	data	$root/.codex/"$'\n'
+  fi
+
+  printf '%s' "$sources"
+}
+
+_update_agents_md_conversations() {
+  # Append a timestamped conversation sources entry to AGENTS.md
+  local sources="$1"
+  [ -z "$sources" ] && return 0
+  [ ! -f "$AGENTS_MD" ] && return 0
+
+  local date_str
+  date_str=$(iso_date)
+
+  # Build the entry block
+  local entry=""
+  entry+="### $date_str"$'\n'
+  while IFS=$'\t' read -r tool type path; do
+    [ -z "$tool" ] && continue
+    entry+="- **$tool** ($type): \`$path\`"$'\n'
+  done <<< "$sources"
+
+  # Check if the section exists
+  if grep -q "^## Conversation Sources" "$AGENTS_MD"; then
+    # Check for placeholder
+    if grep -q "^_No conversation sources detected yet._$" "$AGENTS_MD"; then
+      if [[ "$OSTYPE" == "darwin"* ]]; then
+        # Replace placeholder with the entry (escape newlines for sed)
+        local escaped_entry
+        escaped_entry=$(printf '%s' "$entry" | sed 's/[&/\]/\\&/g; s/$/\\/')
+        escaped_entry="${escaped_entry%\\}"
+        sed -i '' "s/^_No conversation sources detected yet._$/${escaped_entry}/" "$AGENTS_MD"
+      else
+        local escaped_entry
+        escaped_entry=$(printf '%s' "$entry" | sed 's/[&/\]/\\&/g; s/$/\\/')
+        escaped_entry="${escaped_entry%\\}"
+        sed -i "s/^_No conversation sources detected yet._$/${escaped_entry}/" "$AGENTS_MD"
+      fi
+    else
+      # Insert before the first existing ### entry (newest at top)
+      local section_line
+      section_line=$(grep -n "^## Conversation Sources" "$AGENTS_MD" | head -1 | cut -d: -f1)
+      if [ -n "$section_line" ]; then
+        # Find the first "### " line after the section header
+        local first_entry_line
+        first_entry_line=$(tail -n +"$((section_line + 1))" "$AGENTS_MD" | grep -n "^### " | head -1 | cut -d: -f1)
+        if [ -n "$first_entry_line" ]; then
+          local insert_before=$((section_line + first_entry_line))
+          local tmpfile
+          tmpfile=$(mktemp)
+          head -n "$((insert_before - 1))" "$AGENTS_MD" > "$tmpfile"
+          printf '%s\n' "$entry" >> "$tmpfile"
+          tail -n +"$insert_before" "$AGENTS_MD" >> "$tmpfile"
+          mv "$tmpfile" "$AGENTS_MD"
+        fi
+      fi
+    fi
+  else
+    # Section doesn't exist — append it at the end (before the final ---)
+    # Or just append at the end
+    printf '\n## Conversation Sources\n\n%s\n' "$entry" >> "$AGENTS_MD"
+  fi
+}
+
 _detect_project_issues() {
   local root
   root=$(repo_root 2>/dev/null || pwd)
@@ -194,6 +327,120 @@ _detect_project_issues() {
   fi
 
   printf '%s' "$issues"
+}
+
+_extract_handover_from_conversations() {
+  # Auto-generate handover content from conversation logs.
+  # Sets AUTOGEN_SUMMARY, AUTOGEN_CONTEXT with recent exchanges.
+  # Returns 0 if content was extracted, 1 if no conversations found.
+  local root="$1"
+  local max_exchanges=20
+
+  local conv_sources
+  conv_sources=$(_detect_conversation_sources "$root")
+  [ -z "$conv_sources" ] && return 1
+
+  local extracted=""
+  local source_tool=""
+
+  while IFS=$'\t' read -r conv_tool conv_type conv_path; do
+    [ -z "$conv_tool" ] && continue
+    [ -n "$extracted" ] && continue  # use the first source found
+
+    if [ "$conv_tool" = "Claude Code" ] && [ "$conv_type" = "conversations" ]; then
+      local latest_jsonl
+      latest_jsonl=$(ls -t "$conv_path"/*.jsonl 2>/dev/null | head -1 || true)
+      [ -z "$latest_jsonl" ] && continue
+      source_tool="Claude Code"
+      extracted=$(python3 -c "
+import json
+
+def extract_user_text(msg_str):
+    try:
+        obj = json.loads(msg_str) if isinstance(msg_str, str) else msg_str
+    except: return ''
+    content = obj.get('content', '') if isinstance(obj, dict) else obj
+    if isinstance(content, str): return content.strip()
+    if isinstance(content, list):
+        return ' '.join(b.get('text','') for b in content if isinstance(b,dict) and b.get('type')=='text').strip()
+    return ''
+
+def extract_assistant_text(msg):
+    if isinstance(msg, str):
+        try: msg = json.loads(msg)
+        except: return ''
+    content = msg.get('content', []) if isinstance(msg, dict) else []
+    if isinstance(content, list):
+        return ' '.join(b.get('text','') for b in content if isinstance(b,dict) and b.get('type')=='text').strip()
+    if isinstance(content, str): return content.strip()
+    return ''
+
+turns = []
+with open('$latest_jsonl') as f:
+    for line in f:
+        try: d = json.loads(line)
+        except: continue
+        if d.get('type') == 'user':
+            text = extract_user_text(d.get('message', ''))
+            if text: turns.append(('user', text))
+        elif d.get('type') == 'assistant':
+            text = extract_assistant_text(d.get('message', {}))
+            if text: turns.append(('assistant', text))
+
+for role, text in turns[-$max_exchanges * 2:]:
+    if len(text) > 1000:
+        text = text[:1000] + '... (truncated)'
+    label = 'User' if role == 'user' else 'Assistant'
+    print(f'**{label}:** {text}')
+    print()
+" 2>/dev/null)
+
+    elif [ "$conv_tool" = "Cosine" ] && [ "$conv_type" = "conversations" ]; then
+      [ ! -f "$conv_path/context.json" ] && continue
+      source_tool="Cosine"
+      extracted=$(python3 -c "
+import json
+
+with open('$conv_path/context.json') as f:
+    data = json.load(f)
+
+window = data.get('window', [])
+turns = []
+for msg in window:
+    role = msg.get('role', '')
+    content = msg.get('content', '')
+    text = ''
+    if isinstance(content, str) and content.strip():
+        text = content.strip()
+    elif isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get('type') in ('text', 'output_text') and b.get('text','').strip():
+                parts.append(b['text'].strip())
+        text = ' '.join(parts)
+    if text and role in ('user', 'assistant'):
+        turns.append((role, text))
+
+for role, text in turns[-$max_exchanges * 2:]:
+    if len(text) > 1000:
+        text = text[:1000] + '... (truncated)'
+    label = 'User' if role == 'user' else 'Assistant'
+    print(f'**{label}:** {text}')
+    print()
+" 2>/dev/null)
+
+    elif [ "$conv_tool" = "Aider" ] && [ "$conv_type" = "conversations" ]; then
+      source_tool="Aider"
+      extracted=$(tail -n 200 "$conv_path" 2>/dev/null)
+    fi
+  done <<< "$conv_sources"
+
+  [ -z "$extracted" ] && return 1
+
+  AUTOGEN_SUMMARY="Auto-generated from $source_tool session ($(iso_date))"
+  AUTOGEN_CONTEXT="$extracted"
+  AUTOGEN_SOURCE="$source_tool"
+  return 0
 }
 
 build_handover_summary_draft() {
@@ -415,6 +662,13 @@ EOF
     echo -e "  ${DIM}CMUX not found. Install from:${RESET} https://cmux.dev"
   fi
 
+  # Detect and record conversation sources
+  local conv_sources
+  conv_sources=$(_detect_conversation_sources "$root")
+  if [ -n "$conv_sources" ]; then
+    _update_agents_md_conversations "$conv_sources"
+  fi
+
   # Create .gitignore additions
   if [ -f .gitignore ]; then
     if ! grep -q ".agents/handovers/" .gitignore 2>/dev/null; then
@@ -451,6 +705,15 @@ EOF
     echo ""
     echo -e "  ${BOLD}Skills:${RESET}"
     echo -e "  ${DIM}$PLAYWRIGHT_SKILLS_DIR${RESET}  Playwright CLI"
+  fi
+
+  if [ -n "$conv_sources" ]; then
+    echo ""
+    echo -e "  ${BOLD}Conversation sources detected:${RESET}"
+    while IFS=$'\t' read -r conv_tool conv_type conv_path; do
+      [ -z "$conv_tool" ] && continue
+      echo -e "  ${DIM}$conv_tool${RESET} ($conv_type): $conv_path"
+    done <<< "$conv_sources"
   fi
 
   echo ""
@@ -526,24 +789,32 @@ cmd_handover() {
     esac
   done
 
-  # If no args, check if stdin has data (piped context)
-  if [ -z "$summary" ] && [ -z "$context" ] && [ ! -t 0 ]; then
-    context=$(cat)
-    summary="Automated handover"
-  fi
+  # If no args provided, try these in order:
+  # 1. Auto-generate from conversation logs (zero effort)
+  # 2. Read piped stdin context
+  # 3. Interactive prompt (terminal only)
+  if [ -z "$summary" ] && [ -z "$context" ]; then
+    if _extract_handover_from_conversations "$root"; then
+      summary="$AUTOGEN_SUMMARY"
+      context="$AUTOGEN_CONTEXT"
+      info "Auto-generated handover from ${BOLD}$AUTOGEN_SOURCE${RESET} conversation logs"
+    elif [ ! -t 0 ]; then
+      # stdin has piped data
+      context=$(cat)
+      summary="Automated handover"
+    elif [ -t 0 ]; then
+      # Interactive terminal — prompt the user
+      summary_draft=$(build_handover_summary_draft "$branch")
+      decisions="_No decisions logged._"
+      learnings="_No learnings or gotchas logged._"
+      next_steps="_No next steps logged._"
 
-  # If still no args and interactive terminal, prompt
-  if [ -z "$summary" ] && [ -t 0 ]; then
-    summary_draft=$(build_handover_summary_draft "$branch")
-    decisions="_No decisions logged._"
-    learnings="_No learnings or gotchas logged._"
-    next_steps="_No next steps logged._"
-
-    review_handover_draft "$branch" "$last_commits" "$staged" "$unstaged" "$summary_draft" "$decisions" "$learnings" "$next_steps" || return 1
-    summary="$HANDOVER_SUMMARY"
-    decisions="$HANDOVER_DECISIONS"
-    learnings="$HANDOVER_LEARNINGS"
-    next_steps="$HANDOVER_NEXT_STEPS"
+      review_handover_draft "$branch" "$last_commits" "$staged" "$unstaged" "$summary_draft" "$decisions" "$learnings" "$next_steps" || return 1
+      summary="$HANDOVER_SUMMARY"
+      decisions="$HANDOVER_DECISIONS"
+      learnings="$HANDOVER_LEARNINGS"
+      next_steps="$HANDOVER_NEXT_STEPS"
+    fi
   fi
 
   [ -z "$summary" ] && summary="Work session $(iso_date)"
@@ -636,6 +907,24 @@ RECSECTION
     fi
   fi
 
+  # Detect and record conversation sources
+  local conv_sources
+  conv_sources=$(_detect_conversation_sources "$root")
+  if [ -n "$conv_sources" ]; then
+    # Append to handover file
+    cat >> "$handover_file" << 'CONVSECTION'
+
+## Conversation Sources
+CONVSECTION
+    while IFS=$'\t' read -r conv_tool conv_type conv_path; do
+      [ -z "$conv_tool" ] && continue
+      echo "- **$conv_tool** ($conv_type): \`$conv_path\`" >> "$handover_file"
+    done <<< "$conv_sources"
+
+    # Update AGENTS.md
+    _update_agents_md_conversations "$conv_sources"
+  fi
+
   # Update AGENTS.md with latest handover summary
   _update_agents_md_progress "$summary" "$learnings" "$next_steps"
 
@@ -656,6 +945,396 @@ RECSECTION
   cmux_progress 1.0 "Handover complete"
   cmux_log "success" "agent" "Handover: $summary"
   cmux_notify "Agent Handover Complete" "$summary"
+}
+
+cmd_resume() {
+  require_init
+  local root
+  root=$(repo_root)
+  cd "$root"
+
+  local project_name
+  project_name=$(basename "$root")
+  local max_turns=20
+  local show_memory=true
+  local show_conversation=true
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --turns|-t)      max_turns="$2"; shift 2 ;;
+      --no-memory)     show_memory=false; shift ;;
+      --no-conversation) show_conversation=false; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  cmux_set_status "agent" "resuming..." --icon "arrow.clockwise" --color "#64B5F6"
+
+  echo "# Agent Resume — $project_name"
+  echo ""
+  echo "> $(iso_date)"
+  echo ""
+
+  # ── 1. Latest handover ──
+  local latest
+  latest=$(find "$HANDOVERS_DIR" -maxdepth 1 -name "*.md" 2>/dev/null | sort -r | head -1)
+  if [ -n "$latest" ]; then
+    echo "## Last Handover"
+    echo ""
+    # Print everything except Git State (verbose) and Conversation Context (already captured)
+    local in_git_state=false
+    local in_conv_context=false
+    while IFS= read -r line; do
+      if [[ "$line" == "## Git State" ]]; then
+        in_git_state=true
+        continue
+      fi
+      if [[ "$line" == "## Conversation Context" ]]; then
+        in_conv_context=true
+        continue
+      fi
+      if [[ "$line" == "## "* ]] && [[ "$line" != "## Git State" ]] && [[ "$line" != "## Conversation Context" ]]; then
+        in_git_state=false
+        in_conv_context=false
+      fi
+      if [ "$in_git_state" = false ] && [ "$in_conv_context" = false ]; then
+        echo "$line"
+      fi
+    done < "$latest"
+    echo ""
+  else
+    echo "## Last Handover"
+    echo ""
+    echo "_No handovers found._"
+    echo ""
+  fi
+
+  # ── 2. Current git state (fresh, not from handover) ──
+  echo "## Current Git State"
+  echo ""
+  local branch
+  branch=$(git branch --show-current 2>/dev/null || echo "unknown")
+  echo "- **Branch:** $branch"
+  local last_commit
+  last_commit=$(git log --oneline -1 2>/dev/null || echo "no commits")
+  echo "- **Last commit:** $last_commit"
+  local uncommitted
+  uncommitted=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  echo "- **Uncommitted changes:** $uncommitted files"
+  if [ "$uncommitted" -gt 0 ]; then
+    echo '```'
+    git status --short 2>/dev/null
+    echo '```'
+  fi
+  echo ""
+
+  # ── 3. Conversation sources — extract recent context ──
+  local conv_sources
+  conv_sources=$(_detect_conversation_sources "$root")
+
+  if [ -n "$conv_sources" ] && [ "$show_conversation" = true ]; then
+    echo "## Recent Conversations"
+    echo ""
+
+    while IFS=$'\t' read -r conv_tool conv_type conv_path; do
+      [ -z "$conv_tool" ] && continue
+
+      if [ "$conv_tool" = "Claude Code" ] && [ "$conv_type" = "conversations" ]; then
+        # Session timeline — list all sessions
+        local session_count=0
+        session_count=$(find "$conv_path" -maxdepth 1 -name "*.jsonl" 2>/dev/null | wc -l | tr -d ' ')
+        if [ "${session_count:-0}" -gt 1 ]; then
+          echo "### Session Timeline ($session_count sessions)"
+          echo ""
+          python3 -c "
+import json, os, glob
+
+def extract_user_text(msg):
+    try:
+        obj = json.loads(msg) if isinstance(msg, str) else msg
+    except: return ''
+    content = obj.get('content', '') if isinstance(obj, dict) else obj
+    if isinstance(content, str): return content.strip()
+    if isinstance(content, list):
+        return ' '.join(b.get('text','') for b in content if isinstance(b,dict) and b.get('type')=='text').strip()
+    return ''
+
+files = sorted(glob.glob('$conv_path/*.jsonl'), key=os.path.getmtime, reverse=True)
+for jf in files:
+    sid = os.path.basename(jf).replace('.jsonl','')
+    ts = None; first = None; turns = 0
+    with open(jf) as f:
+        for line in f:
+            try: d = json.loads(line)
+            except: continue
+            if d.get('type') == 'user':
+                turns += 1
+                if ts is None:
+                    ts = d.get('timestamp','')[:16].replace('T',' ')
+                    first = extract_user_text(d.get('message',''))
+    if ts:
+        first_trunc = (first[:70] + '...') if first and len(first) > 70 else (first or '(no text)')
+        marker = ' **(latest)**' if jf == files[0] else ''
+        print(f'- \`{sid[:8]}\` {ts} — {turns} turns — \"{first_trunc}\"{marker}')
+print()
+" 2>/dev/null
+        fi
+
+        # Latest session — interleaved user/assistant messages
+        local latest_jsonl
+        latest_jsonl=$(ls -t "$conv_path"/*.jsonl 2>/dev/null | head -1 || true)
+        if [ -n "$latest_jsonl" ]; then
+          local session_id
+          session_id=$(basename "$latest_jsonl" .jsonl)
+          local session_ts
+          session_ts=$(python3 -c "
+import json
+with open('$latest_jsonl') as f:
+    for line in f:
+        d = json.loads(line)
+        if d.get('type') == 'user' and d.get('timestamp'):
+            print(d['timestamp'][:19].replace('T', ' '))
+            break
+" 2>/dev/null || echo "unknown")
+          echo "### Latest Session (${session_id:0:8}... started $session_ts)"
+          echo ""
+          python3 -c "
+import json, sys
+
+def extract_user_text(msg_str):
+    try:
+        obj = json.loads(msg_str) if isinstance(msg_str, str) else msg_str
+    except (json.JSONDecodeError, TypeError):
+        return msg_str.strip() if isinstance(msg_str, str) else ''
+    content = obj.get('content', '') if isinstance(obj, dict) else obj
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        texts = []
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                texts.append(block.get('text', ''))
+        return ' '.join(texts).strip()
+    return ''
+
+def extract_assistant_text(msg):
+    if isinstance(msg, str):
+        try: msg = json.loads(msg)
+        except: return ''
+    content = msg.get('content', []) if isinstance(msg, dict) else []
+    if isinstance(content, list):
+        texts = []
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                texts.append(block.get('text', ''))
+        return ' '.join(texts).strip()
+    if isinstance(content, str):
+        return content.strip()
+    return ''
+
+# Collect interleaved turns
+turns = []  # list of (role, text)
+with open('$latest_jsonl') as f:
+    for line in f:
+        try:
+            d = json.loads(line)
+        except:
+            continue
+        if d.get('type') == 'user':
+            text = extract_user_text(d.get('message', ''))
+            if text:
+                turns.append(('user', text))
+        elif d.get('type') == 'assistant':
+            text = extract_assistant_text(d.get('message', {}))
+            if text:
+                turns.append(('assistant', text))
+
+# Show last N exchanges
+max_turns = $max_turns
+shown = turns[-max_turns * 2:]
+for role, text in shown:
+    if len(text) > 500:
+        text = text[:500] + '... (truncated)'
+    if role == 'user':
+        print(f'> **User:** {text}')
+    else:
+        print(f'> **Assistant:** {text}')
+    print()
+" 2>/dev/null
+          echo ""
+        fi
+
+      elif [ "$conv_tool" = "Cosine" ] && [ "$conv_type" = "conversations" ]; then
+        # Cosine stores context.json + metadata.toml per session
+        if [ -f "$conv_path/context.json" ]; then
+          # Session timeline from sessions.json
+          local cosine_sessions_json="$HOME/.cosine/sessions.json"
+          if [ -f "$cosine_sessions_json" ]; then
+            local cosine_session_count
+            cosine_session_count=$(python3 -c "
+import json
+with open('$cosine_sessions_json') as f:
+    data = json.load(f)
+sessions = [s for s in data.get('sessions', []) if s.get('cwd','').rstrip('/') == '$root'.rstrip('/')]
+print(len(sessions))
+" 2>/dev/null || echo "0")
+            if [ "$cosine_session_count" -gt 1 ]; then
+              echo "### Cosine Session Timeline ($cosine_session_count sessions)"
+              echo ""
+              python3 -c "
+import json, os
+with open('$cosine_sessions_json') as f:
+    data = json.load(f)
+sessions = [s for s in data.get('sessions', []) if s.get('cwd','').rstrip('/') == '$root'.rstrip('/')]
+for i, s in enumerate(sessions):
+    marker = ' **(latest)**' if i == 0 else ''
+    title = s.get('title', '(untitled)')
+    if len(title) > 70: title = title[:70] + '...'
+    print(f'- \`{s[\"session_id\"][:12]}\` {s[\"date\"]} — \"{title}\"{marker}')
+" 2>/dev/null
+              echo ""
+            fi
+          fi
+
+          # Latest session conversation
+          local cosine_title
+          cosine_title=$(python3 -c "
+import json
+with open('$conv_path/context.json') as f:
+    data = json.load(f)
+print(data.get('sessionTitle', 'untitled'))
+" 2>/dev/null || echo "untitled")
+          local cosine_date
+          cosine_date=$(basename "$(dirname "$(dirname "$(dirname "$conv_path")")")")/$(basename "$(dirname "$(dirname "$conv_path")")")/$(basename "$(dirname "$conv_path")")
+          echo "### Cosine — Latest Session (\"$cosine_title\", $cosine_date)"
+          echo ""
+          python3 -c "
+import json
+
+with open('$conv_path/context.json') as f:
+    data = json.load(f)
+
+window = data.get('window', [])
+turns = []
+for msg in window:
+    role = msg.get('role', '')
+    content = msg.get('content', '')
+    text = ''
+    if isinstance(content, str) and content.strip():
+        text = content.strip()
+    elif isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict):
+                if b.get('type') in ('text', 'output_text') and b.get('text', '').strip():
+                    parts.append(b['text'].strip())
+        text = ' '.join(parts)
+    if text and role in ('user', 'assistant'):
+        turns.append((role, text))
+
+for role, text in turns[-$max_turns * 2:]:
+    if len(text) > 500:
+        text = text[:500] + '... (truncated)'
+    label = 'User' if role == 'user' else 'Assistant'
+    print(f'> **{label}:** {text}')
+    print()
+" 2>/dev/null
+          echo ""
+        fi
+
+      elif [ "$conv_tool" = "Aider" ] && [ "$conv_type" = "conversations" ]; then
+        echo "### Aider"
+        echo ""
+        # Show last N lines of chat history
+        local aider_lines=$((max_turns * 5))
+        echo '```'
+        tail -n "$aider_lines" "$conv_path" 2>/dev/null
+        echo '```'
+        echo ""
+      fi
+    done <<< "$conv_sources"
+  fi
+
+  # ── 4. Memory files ──
+  if [ "$show_memory" = true ]; then
+    local memory_shown=false
+
+    while IFS=$'\t' read -r conv_tool conv_type conv_path; do
+      [ -z "$conv_tool" ] && continue
+      if [ "$conv_type" = "memory" ] && [ -d "$conv_path" ]; then
+        local mem_files
+        mem_files=$(find "$conv_path" -name "*.md" -type f 2>/dev/null)
+        if [ -n "$mem_files" ]; then
+          if [ "$memory_shown" = false ]; then
+            echo "## Agent Memory"
+            echo ""
+            memory_shown=true
+          fi
+          echo "### $conv_tool Memory"
+          echo ""
+          while IFS= read -r mf; do
+            echo "#### $(basename "$mf")"
+            echo ""
+            cat "$mf"
+            echo ""
+          done <<< "$mem_files"
+        fi
+      fi
+    done <<< "$conv_sources"
+  fi
+
+  # ── 5. Key sections from AGENTS.md ──
+  if [ -f "$AGENTS_MD" ]; then
+    # Extract high-value sections: Project Overview, Architecture, Conventions, What Needs to Be Done
+    # Sections to extract — uses grep patterns (partial match) for flexibility
+    local _resume_patterns=("Project Overview" "Architecture" "Conventions" "What Needs" "Key Files" "How to Run" "Key Entry")
+    local _found_any=false
+
+    for _pattern in "${_resume_patterns[@]}"; do
+      # Find the actual section header (supports numbered headers like "## 1. Project Overview")
+      local _header
+      _header=$(grep -m1 "^## .*${_pattern}" "$AGENTS_MD" 2>/dev/null || true)
+      [ -z "$_header" ] && continue
+
+      # Extract content between this header and the next ## heading
+      local _content
+      _content=$(sed -n "/^${_header//\//\\/}$/,/^## /{/^${_header//\//\\/}$/d;/^## /d;p;}" "$AGENTS_MD" 2>/dev/null || true)
+
+      # Skip if only whitespace, comments, or placeholders
+      local _trimmed
+      _trimmed=$(echo "$_content" | grep -v '^<!--' | grep -v '^$' | grep -v '^_TODO:' | head -1 || true)
+      if [ -n "$_trimmed" ]; then
+        if [ "$_found_any" = false ]; then
+          echo "## Project Context (from AGENTS.md)"
+          echo ""
+          _found_any=true
+        fi
+        # Use the actual header text (minus the ##)
+        echo "### ${_header#\#\# }"
+        echo ""
+        echo "$_content"
+        echo ""
+      fi
+    done
+
+    if [ "$_found_any" = false ]; then
+      echo "---"
+      echo ""
+      echo "Full project context: \`AGENTS.md\` (no key sections filled in yet)"
+    else
+      echo "---"
+      echo ""
+      echo "_Full document: \`AGENTS.md\` | Handover history: \`$HANDOVERS_DIR/\`_"
+    fi
+  else
+    echo "---"
+    echo ""
+    echo "**Warning:** \`AGENTS.md\` not found. Run \`agent init\` to create it."
+  fi
+
+  # ── CMUX ──
+  cmux_set_status "agent" "resumed" --icon "play.circle.fill" --color "#81C784"
+  cmux_log "info" "agent" "Agent resumed for $project_name"
 }
 
 cmd_status() {
@@ -1546,6 +2225,7 @@ cmd_help() {
 
     agent init                    Initialize agent handoff in a git repo
     agent handover                Log progress, decisions, and context
+    agent resume                  Pick up where the last agent left off
     agent status                  Show current agent state
     agent log [n]                 Show recent handover entries
     agent onboard <name> [path]   Register a new/unknown agent tool
@@ -1592,6 +2272,14 @@ cmd_help() {
 
     agent setup                   Check/install global tools
 
+  RESUME OPTIONS
+
+    agent resume                  Full briefing: handover, conversations, memory,
+                                  session timeline, AGENTS.md key sections
+    agent resume --turns 10       Limit conversation history to N exchanges (default: 20)
+    agent resume --no-memory      Skip memory files
+    agent resume --no-conversation Skip conversation history and session timeline
+
   HANDOVER OPTIONS
 
     agent handover --summary "what was done"         -s for short
@@ -1615,6 +2303,9 @@ cmd_help() {
 
     # Pipe conversation context from an agent session
     cat conversation.txt | agent handover -s "Debugging session"
+
+    # Pick up where the last agent left off
+    agent resume
 
     # Check current state
     agent status
@@ -1704,6 +2395,14 @@ _TODO: List key files_
 
 _TODO: Add tasks_
 
+## Conversation Sources
+
+<!-- Auto-populated by `agent init` and `agent handover`. -->
+<!-- Points to where each tool stores conversations and memory, so the next -->
+<!-- agent can pick up prior context. Only file-accessible tools are listed. -->
+
+_No conversation sources detected yet._
+
 ---
 
 ## Agent Handoff Commands
@@ -1711,6 +2410,7 @@ _TODO: Add tasks_
 This repo uses [`agent-handoff`](https://github.com/charis-algomo/agent-handoff) for structured handoffs between agent sessions.
 
 ```bash
+agent resume              # Pick up where the last agent left off
 agent status              # Show current state
 agent handover            # Log progress (interactive)
 agent handover -s "..." -d "..." -l "..." -n "..."  # Log progress (non-interactive)
@@ -1822,8 +2522,9 @@ Read the `AGENTS.md` file in this repository root for all project context,
 architecture decisions, conventions, progress history, and handoff notes.
 
 That file is the single source of truth maintained across all agent sessions.
-Always read it at the start of a new session. Update it when you make
-significant decisions or complete major work.
+Always read it at the start of a new session. For a full briefing including
+prior conversations and memory, run `agent resume` in the terminal. Update
+AGENTS.md when you make significant decisions or complete major work.
 
 If running inside CMUX, use `cmux set-status`, `cmux log`, and `cmux notify`
 to provide real-time progress visibility. See AGENTS.md for details.
@@ -2083,6 +2784,7 @@ ${learning_entry}
 case "${1:-help}" in
   init)       shift; cmd_init "$@" ;;
   handover)   shift; cmd_handover "$@" ;;
+  resume)     shift; cmd_resume "$@" ;;
   status)     shift; cmd_status "$@" ;;
   log)        shift; cmd_log "$@" ;;
   onboard)    shift; cmd_onboard "$@" ;;

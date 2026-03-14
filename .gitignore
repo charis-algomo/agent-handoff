@@ -1,1 +1,5 @@
 .DS_Store
+
+# Agent handoff context dumps (can be large)
+# Uncomment the next line to exclude handover logs from git
+# .agents/handovers/
